@@ -4,7 +4,7 @@
 
 # GPU inference batch script for LOBbench pipeline.
 # All parameters received via --export from run_lobbench_pipeline.sh:
-#   REPO_DIR, PYTHON, STOCK, DATA_DIR, CKPT_PATH, CHECKPOINT_STEP,
+#   INFER_REPO_DIR (or REPO_DIR), PYTHON, STOCK, DATA_DIR, CKPT_PATH, CHECKPOINT_STEP,
 #   RUN_NAME, BATCH_SIZE, N_COND_MSGS, N_GEN_MSGS, N_SEQUENCES,
 #   SAMPLE_INDICES_FILE, SKIP_HF_COMPARE
 
@@ -18,7 +18,8 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 export PYTHONUNBUFFERED=1
 
-SAVE_DIR="${REPO_DIR}/LOBS5/inference_results/${RUN_NAME}_${STOCK}_${SLURM_JOB_ID}"
+INFER_REPO_DIR="${INFER_REPO_DIR:-${REPO_DIR:-/projects/s5e/lob_pipeline}}"
+SAVE_DIR="${INFER_REPO_DIR}/LOBS5/inference_results/${RUN_NAME}_${STOCK}_${SLURM_JOB_ID}"
 
 echo "=============================================="
 echo "LOBbench Pipeline: Inference"
@@ -26,6 +27,7 @@ echo "=============================================="
 echo "Job ID:      ${SLURM_JOB_ID}"
 echo "Stock:       ${STOCK}"
 echo "Checkpoint:  ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
+echo "Infer repo:  ${INFER_REPO_DIR}"
 echo "Data:        ${DATA_DIR}"
 echo "Output:      ${SAVE_DIR}"
 echo "Config:      ${N_COND_MSGS} cond + ${N_GEN_MSGS} gen, batch ${BATCH_SIZE}"
@@ -52,31 +54,84 @@ if [ "$n_msg_files" -eq 0 ] && [ "$n_proc_files" -eq 0 ]; then
     exit 1
 fi
 
-# Build inference command
-cd "${REPO_DIR}/LOBS5"
+# Build inference command args
+cd "${INFER_REPO_DIR}/LOBS5"
 
-CMD="$PYTHON -u run_inference.py \
-    --stock $STOCK \
-    --ckpt_path \"$CKPT_PATH\" \
-    --data_dir \"$DATA_DIR\" \
-    --save_dir \"$SAVE_DIR\" \
-    --n_cond_msgs $N_COND_MSGS \
-    --n_gen_msgs $N_GEN_MSGS \
-    --n_sequences $N_SEQUENCES \
-    --batch_size $BATCH_SIZE \
-    --checkpoint_step $CHECKPOINT_STEP \
-    --test_split 1.0"
+INFER_ARGS=(
+    --stock "$STOCK"
+    --ckpt_path "$CKPT_PATH"
+    --data_dir "$DATA_DIR"
+    --save_dir "$SAVE_DIR"
+    --n_cond_msgs "$N_COND_MSGS"
+    --n_gen_msgs "$N_GEN_MSGS"
+    --n_sequences "$N_SEQUENCES"
+    --batch_size "$BATCH_SIZE"
+    --checkpoint_step "$CHECKPOINT_STEP"
+    --test_split 1.0
+)
 
 # HF mode: add sample indices file
 if [ -n "${SAMPLE_INDICES_FILE:-}" ] && [ -f "${SAMPLE_INDICES_FILE:-}" ]; then
-    CMD="$CMD --sample_indices_file \"$SAMPLE_INDICES_FILE\""
+    INFER_ARGS+=(--sample_indices_file "$SAMPLE_INDICES_FILE")
 fi
 
 echo ""
-echo "Running: ${CMD}"
+echo "Running: ${PYTHON} -u run_inference.py ${INFER_ARGS[*]}"
+echo "Runtime patch: global_bsz guard active (argparse + metadata + init_train_state)"
 echo ""
 
-eval $CMD && EXIT_CODE=0 || EXIT_CODE=$?
+"$PYTHON" -u - "${INFER_ARGS[@]}" <<'PY' && EXIT_CODE=0 || EXIT_CODE=$?
+import argparse
+import runpy
+
+import lob.init_train as _init_train
+
+_orig_parse_args = argparse.ArgumentParser.parse_args
+_orig_parse_known_args = argparse.ArgumentParser.parse_known_args
+_orig_init_train_state = _init_train.init_train_state
+_orig_load_metadata = _init_train.load_metadata
+
+
+def _ensure_global_bsz(ns):
+    if not hasattr(ns, "global_bsz"):
+        bsz = getattr(ns, "bsz", None)
+        if bsz is None:
+            bsz = getattr(ns, "batch_size", 1)
+        num_devices = getattr(ns, "num_devices", 1)
+        ns.global_bsz = max(1, int(bsz) * int(num_devices))
+    return ns
+
+
+def _parse_args_with_global_bsz(self, *args, **kwargs):
+    ns = _orig_parse_args(self, *args, **kwargs)
+    return _ensure_global_bsz(ns)
+
+
+def _parse_known_args_with_global_bsz(self, *args, **kwargs):
+    ns, extras = _orig_parse_known_args(self, *args, **kwargs)
+    return _ensure_global_bsz(ns), extras
+
+
+def _load_metadata_with_global_bsz(*args, **kwargs):
+    ns = _orig_load_metadata(*args, **kwargs)
+    ns = _ensure_global_bsz(ns)
+    if not hasattr(ns, "token_mode"):
+        ns.token_mode = 22
+        print("[*] Runtime patch: token_mode missing in metadata, defaulting to legacy token_mode=22")
+    return ns
+
+
+def _init_train_state_with_global_bsz(args, *iargs, **ikwargs):
+    args = _ensure_global_bsz(args)
+    return _orig_init_train_state(args, *iargs, **ikwargs)
+
+
+argparse.ArgumentParser.parse_args = _parse_args_with_global_bsz
+argparse.ArgumentParser.parse_known_args = _parse_known_args_with_global_bsz
+_init_train.load_metadata = _load_metadata_with_global_bsz
+_init_train.init_train_state = _init_train_state_with_global_bsz
+runpy.run_path("run_inference.py", run_name="__main__")
+PY
 
 echo ""
 echo "=============================================="

@@ -4,7 +4,8 @@
 
 # CPU scoring batch script for LOBbench pipeline.
 # All parameters received via --export from run_lobbench_pipeline.sh:
-#   REPO_DIR, PYTHON, STOCK, RUN_NAME, INFER_OUTPUT, SKIP_HF_COMPARE
+#   LOB_BENCH_DIR, RESULTS_BASE_DIR, PYTHON, STOCK, RUN_NAME,
+#   INFER_OUTPUT, SKIP_HF_COMPARE
 
 set -euo pipefail
 
@@ -14,9 +15,12 @@ export PYTHONUNBUFFERED=1
 # Extra packages (statsmodels, plotly, kaleido) installed outside conda env due to quota limits
 export PYTHONPATH="/lus/lfs1aip2/projects/s5e/lob_pipeline/pip_packages${PYTHONPATH:+:$PYTHONPATH}"
 
-BENCH_DATA="${REPO_DIR}/bench_data"
-RESULTS_DIR="${REPO_DIR}/results_${RUN_NAME}"
-HF_DATA="${REPO_DIR}/lob_bench/hf_data_git"
+LOB_BENCH_DIR="${LOB_BENCH_DIR:-/home/s5e/satyamaga.s5e/lob_bench}"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${PIPELINE_DIR:-$PWD}}"
+
+BENCH_DATA="${LOB_BENCH_DIR}/bench_data"
+RESULTS_DIR="${RESULTS_BASE_DIR}/results_${RUN_NAME}"
+HF_DATA="${LOB_BENCH_DIR}/hf_data_git"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -26,6 +30,7 @@ echo "=============================================="
 echo "Job ID:      ${SLURM_JOB_ID}"
 echo "Stock:       ${STOCK}"
 echo "Run name:    ${RUN_NAME}"
+echo "LOBbench:    ${LOB_BENCH_DIR}"
 echo "Infer data:  ${INFER_OUTPUT}"
 echo "HF compare:  $([ "${SKIP_HF_COMPARE}" -eq 0 ] && echo "yes" || echo "no")"
 echo "=============================================="
@@ -152,8 +157,7 @@ fi
 echo ""
 echo "--- Phase 4: Scoring ---"
 
-# cd "${REPO_DIR}/lob_bench"
-cd "/home/s5e/satyamaga.s5e/lob_bench"
+cd "${LOB_BENCH_DIR}"
 
 SCORE_ERRORS=0
 for MODEL in $MODELS_TO_SCORE; do

@@ -13,8 +13,21 @@ set -euo pipefail
 # Usage:
 #   ./pipeline/run_lobbench_pipeline.sh <CKPT_PATH> [OPTIONS]
 
-SCRIPT_DIR="/projects/s5e/lob_pipeline/pipeline"
-REPO_DIR="/projects/s5e/lob_pipeline"
+PIPELINE_DIR_DEFAULT="$(pwd)"
+PIPELINE_DIR="${PIPELINE_DIR:-$PIPELINE_DIR_DEFAULT}"
+
+# Inference code source (must come from /projects/.../lob_pipeline)
+INFER_REPO_DIR="${INFER_REPO_DIR:-/projects/s5e/lob_pipeline}"
+
+# LOBbench code source (must come from satyamaga.s5e workspace)
+LOB_BENCH_DIR="${LOB_BENCH_DIR:-/home/s5e/satyamaga.s5e/lob_bench}"
+
+# Results root (defaults to current working directory pipeline)
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-$PIPELINE_DIR}"
+
+# Backward-compatible aliases used elsewhere in this script
+SCRIPT_DIR="$PIPELINE_DIR"
+REPO_DIR="$INFER_REPO_DIR"
 
 # ============================================================
 # Defaults
@@ -31,7 +44,7 @@ INFER_WALLTIME="06:00:00"
 BENCH_WALLTIME="24:00:00"
 SKIP_INFERENCE=0
 INFERENCE_DIR=""
-LOGS_DIR="./logs"
+LOGS_DIR="${PIPELINE_DIR}/logs"
 
 # ============================================================
 # Parse arguments
@@ -148,7 +161,7 @@ echo "[*] Stocks: ${VALID_STOCKS}"
 # ============================================================
 extract_hf_indices() {
     local stock="$1"
-    local hf_gen="${REPO_DIR}/lob_bench/hf_data_git/${stock}/data_gen_lobs5"
+    local hf_gen="${LOB_BENCH_DIR}/hf_data_git/${stock}/data_gen_lobs5"
     local out_file="${SCRIPT_DIR}/.hf_indices_${stock}.txt"
 
     if [ ! -d "$hf_gen" ]; then
@@ -192,6 +205,9 @@ echo ""
 echo "=============================================="
 echo "LOBbench Pipeline: ${NAME}"
 echo "=============================================="
+echo "Pipeline dir: ${PIPELINE_DIR}"
+echo "Inference repo: ${INFER_REPO_DIR}"
+echo "LOBbench dir: ${LOB_BENCH_DIR}"
 echo "Checkpoint: ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
 echo "Mode: $([ "$NO_HF_COMPARE" -eq 1 ] && echo "Custom (${N_SEQUENCES} random)" || echo "HF (matched samples)")"
 echo "Config: ${N_COND_MSGS} cond + ${N_GEN_MSGS} gen, batch ${BATCH_SIZE}"
@@ -229,13 +245,13 @@ for STOCK in $VALID_STOCKS; do
             --output="${LOGS_DIR}/infer_${NAME}_${STOCK}_%j.out" \
             --error="${LOGS_DIR}/infer_${NAME}_${STOCK}_%j.err" \
             --partition="${PARTITION}" \
-            --export=ALL,REPO_DIR="${REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",DATA_DIR="${DATA_DIR}",CKPT_PATH="${CKPT_PATH}",CHECKPOINT_STEP="${CHECKPOINT_STEP}",RUN_NAME="${NAME}",BATCH_SIZE="${BATCH_SIZE}",N_COND_MSGS="${N_COND_MSGS}",N_GEN_MSGS="${N_GEN_MSGS}",N_SEQUENCES="${N_SEQUENCES}",SAMPLE_INDICES_FILE="${SAMPLE_INDICES_FILE}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",NTFY_TOPIC_INFERENCE="${NTFY_TOPIC_INFERENCE}" \
+            --export=ALL,PIPELINE_DIR="${PIPELINE_DIR}",INFER_REPO_DIR="${INFER_REPO_DIR}",REPO_DIR="${INFER_REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",DATA_DIR="${DATA_DIR}",CKPT_PATH="${CKPT_PATH}",CHECKPOINT_STEP="${CHECKPOINT_STEP}",RUN_NAME="${NAME}",BATCH_SIZE="${BATCH_SIZE}",N_COND_MSGS="${N_COND_MSGS}",N_GEN_MSGS="${N_GEN_MSGS}",N_SEQUENCES="${N_SEQUENCES}",SAMPLE_INDICES_FILE="${SAMPLE_INDICES_FILE}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",NTFY_TOPIC_INFERENCE="${NTFY_TOPIC_INFERENCE}" \
             "${SCRIPT_DIR}/_infer.batch")
 
         echo "  Inference job: ${INFER_JOB_ID}"
 
         # Infer output dir (matches _infer.batch convention)
-        INFER_OUTPUT="${REPO_DIR}/LOBS5/inference_results/${NAME}_${STOCK}_${INFER_JOB_ID}"
+        INFER_OUTPUT="${INFER_REPO_DIR}/LOBS5/inference_results/${NAME}_${STOCK}_${INFER_JOB_ID}"
         DEPENDENCY="--dependency=afterok:${INFER_JOB_ID}"
     else
         echo "  Skipping inference (reusing ${INFERENCE_DIR})"
@@ -254,7 +270,7 @@ for STOCK in $VALID_STOCKS; do
         --output="${LOGS_DIR}/bench_${NAME}_${STOCK}_%j.out" \
         --error="${LOGS_DIR}/bench_${NAME}_${STOCK}_%j.err" \
         --partition="${PARTITION}" \
-        --export=ALL,REPO_DIR="${REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",RUN_NAME="${NAME}",INFER_OUTPUT="${INFER_OUTPUT}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",NTFY_TOPIC_BENCHMARKS="${NTFY_TOPIC_BENCHMARKS}" \
+        --export=ALL,PIPELINE_DIR="${PIPELINE_DIR}",RESULTS_BASE_DIR="${RESULTS_BASE_DIR}",LOB_BENCH_DIR="${LOB_BENCH_DIR}",REPO_DIR="${INFER_REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",RUN_NAME="${NAME}",INFER_OUTPUT="${INFER_OUTPUT}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",NTFY_TOPIC_BENCHMARKS="${NTFY_TOPIC_BENCHMARKS}" \
         "${SCRIPT_DIR}/_bench.batch")
 
     echo "  Bench job:     ${BENCH_JOB_ID} (depends on ${INFER_JOB_ID})"
@@ -273,6 +289,6 @@ echo "Monitor with:"
 echo "  squeue --me"
 echo ""
 echo "Results will be at:"
-echo "  ${REPO_DIR}/results_${NAME}/"
+echo "  ${RESULTS_BASE_DIR}/results_${NAME}/"
 echo ""
 echo "Bench job IDs:${ALL_BENCH_JOBS}"
