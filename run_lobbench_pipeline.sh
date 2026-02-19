@@ -1,4 +1,6 @@
 #!/bin/bash
+#SBATCH --output=./logs/slurm-%j.out
+#SBATCH --error=./logs/slurm-%j.err
 set -euo pipefail
 
 # LOBbench Automation Pipeline
@@ -11,15 +13,15 @@ set -euo pipefail
 # Usage:
 #   ./pipeline/run_lobbench_pipeline.sh <CKPT_PATH> [OPTIONS]
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_DIR="/projects/s5e/lob_pipeline/pipeline"
+REPO_DIR="/projects/s5e/lob_pipeline"
 
 # ============================================================
 # Defaults
 # ============================================================
 NAME=""
 CHECKPOINT_STEP=""
-STOCKS="GOOG INTC"
+STOCKS="GOOG"
 BATCH_SIZE=64
 N_COND_MSGS=500
 N_GEN_MSGS=500
@@ -29,6 +31,7 @@ INFER_WALLTIME="06:00:00"
 BENCH_WALLTIME="24:00:00"
 SKIP_INFERENCE=0
 INFERENCE_DIR=""
+LOGS_DIR="./logs"
 
 # ============================================================
 # Parse arguments
@@ -180,7 +183,6 @@ fi
 # ============================================================
 # Create logs directory
 # ============================================================
-LOGS_DIR="${REPO_DIR}/logs"
 mkdir -p "$LOGS_DIR"
 
 # ============================================================
@@ -193,6 +195,7 @@ echo "=============================================="
 echo "Checkpoint: ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
 echo "Mode: $([ "$NO_HF_COMPARE" -eq 1 ] && echo "Custom (${N_SEQUENCES} random)" || echo "HF (matched samples)")"
 echo "Config: ${N_COND_MSGS} cond + ${N_GEN_MSGS} gen, batch ${BATCH_SIZE}"
+echo "Logs: ${LOGS_DIR}/"
 echo "=============================================="
 echo ""
 

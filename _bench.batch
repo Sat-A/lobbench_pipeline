@@ -152,7 +152,8 @@ fi
 echo ""
 echo "--- Phase 4: Scoring ---"
 
-cd "${REPO_DIR}/lob_bench"
+# cd "${REPO_DIR}/lob_bench"
+cd "/home/s5e/satyamaga.s5e/lob_bench"
 
 SCORE_ERRORS=0
 for MODEL in $MODELS_TO_SCORE; do

@@ -1,0 +1,4 @@
+logs/*
+*.out
+*.txt
+*.err
