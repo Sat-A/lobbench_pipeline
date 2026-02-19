@@ -1,0 +1,99 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --gpus=1
+
+# GPU inference batch script for LOBbench pipeline.
+# All parameters received via --export from run_lobbench_pipeline.sh:
+#   REPO_DIR, PYTHON, STOCK, DATA_DIR, CKPT_PATH, CHECKPOINT_STEP,
+#   RUN_NAME, BATCH_SIZE, N_COND_MSGS, N_GEN_MSGS, N_SEQUENCES,
+#   SAMPLE_INDICES_FILE, SKIP_HF_COMPARE
+
+set -euo pipefail
+
+# Login node's TMPDIR (/local/user/...) is invalid on compute nodes — always use /tmp
+export TMPDIR="/tmp"
+
+# XLA/JAX environment
+export XLA_PYTHON_CLIENT_PREALLOCATE=true
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
+export PYTHONUNBUFFERED=1
+
+SAVE_DIR="${REPO_DIR}/LOBS5/inference_results/${RUN_NAME}_${STOCK}_${SLURM_JOB_ID}"
+
+echo "=============================================="
+echo "LOBbench Pipeline: Inference"
+echo "=============================================="
+echo "Job ID:      ${SLURM_JOB_ID}"
+echo "Stock:       ${STOCK}"
+echo "Checkpoint:  ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
+echo "Data:        ${DATA_DIR}"
+echo "Output:      ${SAVE_DIR}"
+echo "Config:      ${N_COND_MSGS} cond + ${N_GEN_MSGS} gen, batch ${BATCH_SIZE}"
+if [ -n "${SAMPLE_INDICES_FILE:-}" ] && [ -f "${SAMPLE_INDICES_FILE:-}" ]; then
+    echo "Mode:        HF-matched ($(wc -l < "$SAMPLE_INDICES_FILE") indices)"
+else
+    echo "Mode:        Random (${N_SEQUENCES} sequences)"
+fi
+echo "=============================================="
+
+# Validate data directory
+if [ ! -d "$DATA_DIR" ]; then
+    echo "ERROR: Data directory not found: ${DATA_DIR}"
+    exit 1
+fi
+
+# Check for expected data files
+n_msg_files=$(ls "${DATA_DIR}"/*message*.npy 2>/dev/null | wc -l)
+n_book_files=$(ls "${DATA_DIR}"/*book*.npy "${DATA_DIR}"/*orderbook*.npy 2>/dev/null | wc -l)
+n_proc_files=$(ls "${DATA_DIR}"/*_proc.npy 2>/dev/null | wc -l)
+echo "Data files: ${n_msg_files} message, ${n_book_files} book, ${n_proc_files} proc"
+if [ "$n_msg_files" -eq 0 ] && [ "$n_proc_files" -eq 0 ]; then
+    echo "ERROR: No message or proc data files found in ${DATA_DIR}"
+    exit 1
+fi
+
+# Build inference command
+cd "${REPO_DIR}/LOBS5"
+
+CMD="$PYTHON -u run_inference.py \
+    --stock $STOCK \
+    --ckpt_path \"$CKPT_PATH\" \
+    --data_dir \"$DATA_DIR\" \
+    --save_dir \"$SAVE_DIR\" \
+    --n_cond_msgs $N_COND_MSGS \
+    --n_gen_msgs $N_GEN_MSGS \
+    --n_sequences $N_SEQUENCES \
+    --batch_size $BATCH_SIZE \
+    --checkpoint_step $CHECKPOINT_STEP \
+    --test_split 1.0"
+
+# HF mode: add sample indices file
+if [ -n "${SAMPLE_INDICES_FILE:-}" ] && [ -f "${SAMPLE_INDICES_FILE:-}" ]; then
+    CMD="$CMD --sample_indices_file \"$SAMPLE_INDICES_FILE\""
+fi
+
+echo ""
+echo "Running: ${CMD}"
+echo ""
+
+eval $CMD && EXIT_CODE=0 || EXIT_CODE=$?
+
+echo ""
+echo "=============================================="
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "RESULT: FAILED (exit code $EXIT_CODE)"
+else
+    echo "RESULT: SUCCESS"
+    echo "Output: ${SAVE_DIR}"
+    for d in data_real data_gen data_cond; do
+        echo "  ${d}/: $(ls "${SAVE_DIR}/${d}/"*message*.csv 2>/dev/null | wc -l) message files"
+    done
+fi
+echo "=============================================="
+
+# Send notification if topic is configured
+if [ -n "${NTFY_TOPIC_INFERENCE:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+    ~/bin/slurm-notify send "infer_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) finished (exit=$EXIT_CODE)" --topic "$NTFY_TOPIC_INFERENCE"
+fi
+
+exit $EXIT_CODE

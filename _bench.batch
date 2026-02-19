@@ -1,0 +1,219 @@
+#!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --gpus=0
+
+# CPU scoring batch script for LOBbench pipeline.
+# All parameters received via --export from run_lobbench_pipeline.sh:
+#   REPO_DIR, PYTHON, STOCK, RUN_NAME, INFER_OUTPUT, SKIP_HF_COMPARE
+
+set -euo pipefail
+
+# Login node's TMPDIR (/local/user/...) is invalid on compute nodes — always use /tmp
+export TMPDIR="/tmp"
+export PYTHONUNBUFFERED=1
+# Extra packages (statsmodels, plotly, kaleido) installed outside conda env due to quota limits
+export PYTHONPATH="/lus/lfs1aip2/projects/s5e/lob_pipeline/pip_packages${PYTHONPATH:+:$PYTHONPATH}"
+
+BENCH_DATA="${REPO_DIR}/bench_data"
+RESULTS_DIR="${REPO_DIR}/results_${RUN_NAME}"
+HF_DATA="${REPO_DIR}/lob_bench/hf_data_git"
+
+mkdir -p "$RESULTS_DIR"
+
+echo "=============================================="
+echo "LOBbench Pipeline: Scoring"
+echo "=============================================="
+echo "Job ID:      ${SLURM_JOB_ID}"
+echo "Stock:       ${STOCK}"
+echo "Run name:    ${RUN_NAME}"
+echo "Infer data:  ${INFER_OUTPUT}"
+echo "HF compare:  $([ "${SKIP_HF_COMPARE}" -eq 0 ] && echo "yes" || echo "no")"
+echo "=============================================="
+
+# ============================================================
+# Phase 1: Validate inference output
+# ============================================================
+echo ""
+echo "--- Phase 1: Validate inference output ---"
+
+if [ ! -d "${INFER_OUTPUT}/data_gen" ]; then
+    echo "ERROR: Inference output not found: ${INFER_OUTPUT}/data_gen"
+    if [ -n "${NTFY_TOPIC_BENCHMARKS:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+        ~/bin/slurm-notify send "bench_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) FAILED: no inference data" --topic "$NTFY_TOPIC_BENCHMARKS"
+    fi
+    exit 1
+fi
+
+n_gen=$(ls "${INFER_OUTPUT}/data_gen/"*message*.csv 2>/dev/null | wc -l)
+n_real=$(ls "${INFER_OUTPUT}/data_real/"*message*.csv 2>/dev/null | wc -l)
+echo "  Generated: ${n_gen} message files"
+echo "  Real:      ${n_real} message files"
+
+if [ "$n_gen" -eq 0 ]; then
+    echo "ERROR: No generated message files found"
+    if [ -n "${NTFY_TOPIC_BENCHMARKS:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+        ~/bin/slurm-notify send "bench_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) FAILED: empty inference output" --topic "$NTFY_TOPIC_BENCHMARKS"
+    fi
+    exit 1
+fi
+
+# ============================================================
+# Phase 2: Stage data (directory symlinks)
+# ============================================================
+echo ""
+echo "--- Phase 2: Stage data ---"
+
+# Full dataset: symlink entire data dirs
+MODEL_DIR="${BENCH_DATA}/${RUN_NAME}/${STOCK}/2023"
+mkdir -p "${MODEL_DIR}"
+ln -sfn "${INFER_OUTPUT}/data_real" "${MODEL_DIR}/data_real"
+ln -sfn "${INFER_OUTPUT}/data_gen"  "${MODEL_DIR}/data_gen"
+ln -sfn "${INFER_OUTPUT}/data_cond" "${MODEL_DIR}/data_cond"
+echo "  Staged ${RUN_NAME}/${STOCK}: ${n_gen} gen, ${n_real} real"
+
+# ============================================================
+# Phase 3: HF matching (unless skipped)
+# ============================================================
+MODELS_TO_SCORE="${RUN_NAME}"
+
+if [ "${SKIP_HF_COMPARE}" -eq 0 ]; then
+    echo ""
+    echo "--- Phase 3: HF matching ---"
+
+    HF_GEN="${HF_DATA}/${STOCK}/data_gen_lobs5"
+    HF_REAL="${HF_DATA}/${STOCK}/data_real"
+
+    if [ ! -d "$HF_GEN" ]; then
+        echo "  WARNING: No HF gen data for ${STOCK}, skipping HF comparison"
+    else
+        # ---- Our gen + real on overlapping indices ----
+        MATCH_DIR="${BENCH_DATA}/${RUN_NAME}_matched/${STOCK}/2023"
+        mkdir -p "${MATCH_DIR}/data_real" "${MATCH_DIR}/data_gen" "${MATCH_DIR}/data_cond"
+
+        # ---- HF gen + our real on overlapping indices ----
+        HF_MATCH_DIR="${BENCH_DATA}/hf_${RUN_NAME}_matched/${STOCK}/2023"
+        mkdir -p "${HF_MATCH_DIR}/data_real" "${HF_MATCH_DIR}/data_gen" "${HF_MATCH_DIR}/data_cond"
+
+        matched=0
+        hf_matched=0
+
+        for hf_gen_file in "${HF_GEN}"/*message*.csv; do
+            rid=$(basename "$hf_gen_file" | sed 's/.*real_id_//' | sed 's/_gen.*//')
+            date_str=$(basename "$hf_gen_file" | cut -d'_' -f2)
+
+            # Check if we generated this real_id
+            our_gen="${INFER_OUTPUT}/data_gen/${STOCK}_${date_str}_message_real_id_${rid}_gen_id_0.csv"
+            our_real="${INFER_OUTPUT}/data_real/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+
+            if [ -f "$our_gen" ] && [ -f "$our_real" ]; then
+                # ---- Our matched subset ----
+                ln -sf "$our_gen" "${MATCH_DIR}/data_gen/${STOCK}_${date_str}_message_real_id_${rid}_gen_id_0.csv"
+                our_gen_book="${INFER_OUTPUT}/data_gen/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+                [ -f "$our_gen_book" ] && ln -sf "$our_gen_book" "${MATCH_DIR}/data_gen/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+
+                ln -sf "$our_real" "${MATCH_DIR}/data_real/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                our_real_book="${INFER_OUTPUT}/data_real/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                [ -f "$our_real_book" ] && ln -sf "$our_real_book" "${MATCH_DIR}/data_real/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+
+                our_cond="${INFER_OUTPUT}/data_cond/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                our_cond_book="${INFER_OUTPUT}/data_cond/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                [ -f "$our_cond" ] && ln -sf "$our_cond" "${MATCH_DIR}/data_cond/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                [ -f "$our_cond_book" ] && ln -sf "$our_cond_book" "${MATCH_DIR}/data_cond/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                matched=$((matched + 1))
+
+                # ---- HF gen + our real (fair comparison) ----
+                # Use our real data (same real_id) with HF's generated data
+                ln -sf "$hf_gen_file" "${HF_MATCH_DIR}/data_gen/${STOCK}_${date_str}_message_real_id_${rid}_gen_id_0.csv"
+                hf_gen_book="${HF_DATA}/${STOCK}/data_gen_lobs5/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+                [ -f "$hf_gen_book" ] && ln -sf "$hf_gen_book" "${HF_MATCH_DIR}/data_gen/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+
+                ln -sf "$our_real" "${HF_MATCH_DIR}/data_real/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                [ -f "$our_real_book" ] && ln -sf "$our_real_book" "${HF_MATCH_DIR}/data_real/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                [ -f "$our_cond" ] && ln -sf "$our_cond" "${HF_MATCH_DIR}/data_cond/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                [ -f "$our_cond_book" ] && ln -sf "$our_cond_book" "${HF_MATCH_DIR}/data_cond/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                hf_matched=$((hf_matched + 1))
+            fi
+        done
+
+        echo "  ${RUN_NAME}_matched: ${matched} overlapping samples"
+        echo "  hf_${RUN_NAME}_matched: ${hf_matched} HF gen + our real"
+
+        if [ "$matched" -gt 0 ]; then
+            MODELS_TO_SCORE="${MODELS_TO_SCORE} ${RUN_NAME}_matched hf_${RUN_NAME}_matched"
+        else
+            echo "  WARNING: No overlapping samples found — HF comparison skipped"
+        fi
+    fi
+fi
+
+# ============================================================
+# Phase 4: Score
+# ============================================================
+echo ""
+echo "--- Phase 4: Scoring ---"
+
+cd "${REPO_DIR}/lob_bench"
+
+SCORE_ERRORS=0
+for MODEL in $MODELS_TO_SCORE; do
+    CHECK="${BENCH_DATA}/${MODEL}/${STOCK}/2023/data_real"
+    n_check=$(ls "${CHECK}"/*message*.csv 2>/dev/null | wc -l)
+    if [ "$n_check" -eq 0 ]; then
+        echo "  Skipping ${MODEL}/${STOCK}: no real data"
+        continue
+    fi
+
+    echo ""
+    echo "  Scoring ${MODEL} / ${STOCK} (${n_check} samples)..."
+
+    # Phase 4a: Unconditional scoring (baseline — must succeed)
+    echo "    [uncond] Running unconditional scoring..."
+    $PYTHON -u run_bench.py \
+        --data_dir "$BENCH_DATA" \
+        --model_name "$MODEL" \
+        --stock "$STOCK" \
+        --time_period 2023 \
+        --save_dir "$RESULTS_DIR" \
+        --uncond_only \
+        --progress_interval 120 || { echo "  ERROR: ${MODEL}/${STOCK} uncond scoring failed"; SCORE_ERRORS=$((SCORE_ERRORS + 1)); }
+
+    # Phase 4b: Extended metrics (KS + time-lagged + contextual — non-fatal)
+    echo "    [extended] Running all scoring modes (KS, time-lagged, contextual)..."
+    $PYTHON -u run_bench.py \
+        --data_dir "$BENCH_DATA" \
+        --model_name "$MODEL" \
+        --stock "$STOCK" \
+        --time_period 2023 \
+        --save_dir "$RESULTS_DIR" \
+        --all \
+        --progress_interval 120 2>&1 || { echo "  WARNING: ${MODEL}/${STOCK} extended scoring failed (non-fatal)"; }
+done
+
+# ============================================================
+# Phase 5: Plots (non-fatal)
+# ============================================================
+echo ""
+echo "--- Phase 5: Plots ---"
+
+mkdir -p "${RESULTS_DIR}/plots"
+$PYTHON -u run_plotting.py \
+    --score_dir "${RESULTS_DIR}/scores" \
+    --plot_dir "${RESULTS_DIR}/plots" \
+    --histograms 2>&1 || echo "WARNING: Plotting failed (non-fatal)"
+
+# ============================================================
+# Summary
+# ============================================================
+echo ""
+echo "=============================================="
+echo "COMPLETE: ${RUN_NAME} / ${STOCK}"
+echo "=============================================="
+echo "Results: ${RESULTS_DIR}"
+echo "Score errors: ${SCORE_ERRORS}"
+ls -la "${RESULTS_DIR}/scores/"*"${STOCK}"* 2>/dev/null || echo "  (no score files for ${STOCK})"
+echo "=============================================="
+
+# Send notification if topic is configured
+if [ -n "${NTFY_TOPIC_BENCHMARKS:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+    ~/bin/slurm-notify send "bench_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) finished (errors=${SCORE_ERRORS})" --topic "$NTFY_TOPIC_BENCHMARKS"
+fi

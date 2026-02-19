@@ -1,0 +1,35 @@
+#!/bin/bash
+# LOBbench Pipeline Configuration Template
+# Copy this to config.sh and edit paths for your environment.
+#
+# Usage:
+#   cp pipeline/config.sh.template pipeline/config.sh
+#   # Edit paths below for your user
+#   ./pipeline/run_lobbench_pipeline.sh <CKPT_PATH>
+
+# ============================================================
+# Data directories (per stock)
+# ============================================================
+# GOOG: Jan 2023 test set (24tok_preproc format)
+# Default location in shared space, or override with your own path
+GOOG_DATA="${GOOG_DATA:-/lus/lfs1aip2/home/s5e/kangli.s5e/GOOG2023/data/test_set/GOOG}"
+
+# INTC: Jan 2023 (proc.npy format, 41-col books padded at runtime)
+# Default location, or override with your own path
+INTC_DATA="${INTC_DATA:-/lus/lfs1aip2/projects/s5e/lob_pipeline/data/INTC_jan2023}"
+
+# ============================================================
+# Python interpreter (direct path, no conda activation needed)
+# ============================================================
+# Auto-detect: Use miniforge3/envs/lobs5 from user's home, or override
+PYTHON="${PYTHON:-/lus/lfs1aip2/home/s5e/\${USER}/miniforge3/envs/lobs5/bin/python}"
+
+# Fallback to kangli's environment if yours doesn't exist
+if [ ! -f "$PYTHON" ]; then
+    PYTHON="/lus/lfs1aip2/home/s5e/kangli.s5e/miniforge3/envs/lobs5/bin/python"
+fi
+
+# ============================================================
+# SLURM settings
+# ============================================================
+PARTITION="workq"
