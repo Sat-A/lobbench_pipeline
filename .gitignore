@@ -2,3 +2,7 @@ logs/*
 *.out
 *.txt
 *.err
+slurm-*.out
+slurm-*.err
+results_*/
+all_scores/*

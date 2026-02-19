@@ -179,7 +179,7 @@ for MODEL in $MODELS_TO_SCORE; do
         --stock "$STOCK" \
         --time_period 2023 \
         --save_dir "$RESULTS_DIR" \
-        --uncond_only \
+        --uncond \
         --progress_interval 120 || { echo "  ERROR: ${MODEL}/${STOCK} uncond scoring failed"; SCORE_ERRORS=$((SCORE_ERRORS + 1)); }
 
     # Phase 4b: Extended metrics (KS + time-lagged + contextual — non-fatal)
