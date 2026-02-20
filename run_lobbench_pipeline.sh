@@ -23,7 +23,7 @@ INFER_REPO_DIR="${INFER_REPO_DIR:-/projects/s5e/lob_pipeline}"
 LOB_BENCH_DIR="${LOB_BENCH_DIR:-/home/s5e/satyamaga.s5e/lob_bench}"
 
 # Results root (defaults to current working directory pipeline)
-RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-$PIPELINE_DIR}"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-/projects/s5e/lob_pipeline}"
 
 # Backward-compatible aliases used elsewhere in this script
 SCRIPT_DIR="$PIPELINE_DIR"
@@ -161,7 +161,7 @@ echo "[*] Stocks: ${VALID_STOCKS}"
 # ============================================================
 extract_hf_indices() {
     local stock="$1"
-    local hf_gen="${LOB_BENCH_DIR}/hf_data_git/${stock}/data_gen_lobs5"
+    local hf_gen="/projects/s5e/lob_pipeline/lob_bench/hf_data_git/${stock}/data_gen_lobs5"
     local out_file="${SCRIPT_DIR}/.hf_indices_${stock}.txt"
 
     if [ ! -d "$hf_gen" ]; then

@@ -16,11 +16,11 @@ export PYTHONUNBUFFERED=1
 export PYTHONPATH="/lus/lfs1aip2/projects/s5e/lob_pipeline/pip_packages${PYTHONPATH:+:$PYTHONPATH}"
 
 LOB_BENCH_DIR="${LOB_BENCH_DIR:-/home/s5e/satyamaga.s5e/lob_bench}"
-RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-${PIPELINE_DIR:-$PWD}}"
+RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-/projects/s5e/lob_pipeline}"
 
-BENCH_DATA="${LOB_BENCH_DIR}/bench_data"
+BENCH_DATA="/projects/s5e/lob_bench/bench_data"
 RESULTS_DIR="${RESULTS_BASE_DIR}/results_${RUN_NAME}"
-HF_DATA="${LOB_BENCH_DIR}/hf_data_git"
+HF_DATA="/projects/s5e/lob_pipeline/lob_bench/hf_data_git"
 
 mkdir -p "$RESULTS_DIR"
 
