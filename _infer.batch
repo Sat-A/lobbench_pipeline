@@ -55,6 +55,63 @@ if [ "$n_msg_files" -eq 0 ] && [ "$n_proc_files" -eq 0 ]; then
     exit 1
 fi
 
+# ============================================================
+# Pre-flight: detect model architecture for compatibility patching
+# ============================================================
+# Older checkpoints use FullLobPredModel (merging='projected') which lacks
+# __call_ar__, __call_rnn__, and initialize_carry. We detect this and force
+# merging='padded' at runtime — the core weights (message_encoder, book_encoder,
+# fused_s5, decoder) are shape-compatible since both architectures concatenate
+# along the feature axis producing (seq_len, 2*d_model) for fused_s5.
+# The projection layer weights (message_out_proj, book_out_proj) are loaded
+# but unused. Set LEGACY_COMPAT=0 to disable this override.
+export LEGACY_COMPAT="${LEGACY_COMPAT:-1}"
+
+META_ROOT="${CKPT_PATH}/metadata/_ROOT_METADATA"
+META_STEP="${CKPT_PATH}/${CHECKPOINT_STEP}/metadata/metadata"
+
+MERGING=$("$PYTHON" -c "
+import json, sys
+for path in ['${META_ROOT}', '${META_STEP}']:
+    try:
+        with open(path) as f:
+            raw = f.read()
+        # Some older metadata files have trailing garbage after JSON
+        brace_depth = 0
+        end = 0
+        for i, c in enumerate(raw):
+            if c == '{': brace_depth += 1
+            elif c == '}': brace_depth -= 1
+            if brace_depth == 0 and i > 0:
+                end = i + 1
+                break
+        m = json.loads(raw[:end] if end > 0 else raw)
+        d = m.get('custom', m.get('custom_metadata', m))
+        if isinstance(d, dict) and 'config' in d:
+            d = d['config']
+        v = d.get('merging', '')
+        if v:
+            print(v)
+        else:
+            # No merging field: predates padded/projected split (old FullLobPredModel)
+            print('projected')
+        sys.exit(0)
+    except Exception:
+        pass
+print('unknown')
+" 2>/dev/null)
+
+echo "Detected merging mode: ${MERGING}"
+
+if [ "$MERGING" = "projected" ] && [ "$LEGACY_COMPAT" = "1" ]; then
+    echo "[*] Legacy model detected — will force merging='padded' at runtime"
+    echo "    (projection layer weights loaded but unused; core weights are shape-compatible)"
+    export FORCE_MERGING_PADDED=1
+elif [ "$MERGING" = "projected" ]; then
+    echo "ERROR: merging='projected' checkpoint and LEGACY_COMPAT=0; cannot proceed"
+    exit 2
+fi
+
 # Build inference command args
 cd "${INFER_REPO_DIR}/LOBS5"
 
@@ -83,6 +140,7 @@ echo ""
 
 "$PYTHON" -u - "${INFER_ARGS[@]}" <<'PY' && EXIT_CODE=0 || EXIT_CODE=$?
 import argparse
+import json
 import os
 import runpy
 
@@ -92,6 +150,9 @@ _orig_parse_args = argparse.ArgumentParser.parse_args
 _orig_parse_known_args = argparse.ArgumentParser.parse_known_args
 _orig_init_train_state = _init_train.init_train_state
 _orig_load_metadata = _init_train.load_metadata
+_orig_load_checkpoint = _init_train.load_checkpoint
+
+_force_padded = os.environ.get("FORCE_MERGING_PADDED", "0") == "1"
 
 
 def _ensure_global_bsz(ns):
@@ -104,6 +165,10 @@ def _ensure_global_bsz(ns):
     if not hasattr(ns, "merging"):
         ns.merging = os.environ.get("INFER_DEFAULT_MERGING", "padded")
         print(f"[*] Runtime patch: merging missing in metadata, defaulting to {ns.merging}")
+    # Legacy compat: force projected → padded (weights are shape-compatible)
+    if _force_padded and getattr(ns, "merging", "") != "padded":
+        print(f"[*] Runtime patch: overriding merging='{ns.merging}' → 'padded' (legacy compat)")
+        ns.merging = "padded"
     return ns
 
 
@@ -117,8 +182,34 @@ def _parse_known_args_with_global_bsz(self, *args, **kwargs):
     return _ensure_global_bsz(ns), extras
 
 
+def _load_metadata_robust(path):
+    """Fallback metadata loader that tolerates trailing garbage after JSON."""
+    from argparse import Namespace
+    json_path = path + '/metadata/_ROOT_METADATA'
+    with open(json_path, 'r') as f:
+        raw = f.read()
+    # Brace-depth parser: find the end of the first complete JSON object
+    depth, end = 0, 0
+    for i, c in enumerate(raw):
+        if c == '{': depth += 1
+        elif c == '}': depth -= 1
+        if depth == 0 and i > 0:
+            end = i + 1
+            break
+    metadata = json.loads(raw[:end] if end > 0 else raw)
+    if 'custom' in metadata:
+        return Namespace(**metadata['custom'])
+    elif 'custom_metadata' in metadata:
+        return Namespace(**metadata['custom_metadata'])
+    return Namespace(**metadata)
+
+
 def _load_metadata_with_global_bsz(*args, **kwargs):
-    ns = _orig_load_metadata(*args, **kwargs)
+    try:
+        ns = _orig_load_metadata(*args, **kwargs)
+    except Exception as e:
+        print(f"[*] Runtime patch: load_metadata failed ({e}), using robust fallback")
+        ns = _load_metadata_robust(*args, **kwargs)
     ns = _ensure_global_bsz(ns)
     ns.global_bsz = max(1, int(os.environ.get("INFER_INIT_GLOBAL_BSZ", "1")))
     if not hasattr(ns, "token_mode"):
@@ -126,6 +217,62 @@ def _load_metadata_with_global_bsz(*args, **kwargs):
         print("[*] Runtime patch: token_mode missing in metadata, defaulting to legacy token_mode=22")
     print(f"[*] Runtime patch: forcing inference init global_bsz={ns.global_bsz}")
     return ns
+
+
+def _load_checkpoint_compat(state, path, step=None, train=True, partial_restore=False):
+    """Wrapper that falls back to _load_ocdbt_direct on any restore error.
+
+    When forcing merging='padded' on a 'projected' checkpoint, the param tree
+    has extra keys (message_out_proj, book_out_proj).  StandardRestore may
+    reject the mismatch, so we catch broadly and fall back to the direct
+    tensorstore loader which is structure-agnostic.
+    """
+    try:
+        return _orig_load_checkpoint(state, path, step=step, train=train,
+                                     partial_restore=partial_restore)
+    except Exception as first_err:
+        if not _force_padded:
+            raise
+        print(f"[*] Runtime patch: load_checkpoint failed ({first_err})")
+        print(f"[*] Runtime patch: retrying with _load_ocdbt_direct (legacy compat)")
+        import jax
+        import orbax.checkpoint as ocp
+
+        if step is None:
+            mngr = ocp.CheckpointManager(os.path.abspath(path),
+                                          item_names=('state', 'metadata'))
+            step = mngr.latest_step()
+        params = _init_train._load_ocdbt_direct(os.path.abspath(path), step)
+        loaded_state = state.replace(params=params, step=step)
+
+        # Load per-step metadata
+        metadata_path = os.path.join(os.path.abspath(path), str(step),
+                                     "metadata", "metadata")
+        ckpt = {}
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as f:
+                raw = f.read()
+            try:
+                ckpt = json.loads(raw)
+            except json.JSONDecodeError:
+                # Tolerate trailing garbage (same as _load_metadata_robust)
+                depth, end = 0, 0
+                for i, c in enumerate(raw):
+                    if c == '{': depth += 1
+                    elif c == '}': depth -= 1
+                    if depth == 0 and i > 0:
+                        end = i + 1
+                        break
+                ckpt = json.loads(raw[:end]) if end > 0 else {}
+
+        if train:
+            from lob.sharding_utils import get_global_mesh, create_state_shardings
+            mesh = get_global_mesh()
+            state_shardings = create_state_shardings(loaded_state, mesh)
+            ckpt['model'] = jax.device_put(loaded_state, state_shardings)
+        else:
+            ckpt['model'] = loaded_state
+        return ckpt
 
 
 def _init_train_state_with_global_bsz(args, *iargs, **ikwargs):
@@ -137,6 +284,7 @@ argparse.ArgumentParser.parse_args = _parse_args_with_global_bsz
 argparse.ArgumentParser.parse_known_args = _parse_known_args_with_global_bsz
 _init_train.load_metadata = _load_metadata_with_global_bsz
 _init_train.init_train_state = _init_train_state_with_global_bsz
+_init_train.load_checkpoint = _load_checkpoint_compat
 runpy.run_path("run_inference.py", run_name="__main__")
 PY
 
