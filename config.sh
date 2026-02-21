@@ -12,7 +12,7 @@
 # ============================================================
 # GOOG: Jan 2023 test set (24tok_preproc format)
 # Default location in shared space
-GOOG_DATA="${GOOG_DATA:-/lus/lfs1aip2/home/s5e/kangli.s5e/GOOG2023/data/test_set/GOOG}"
+GOOG_DATA="${GOOG_DATA:-/projects/s5e/quant/JAN2023/GOOG_24tok_preproc}"
 
 # INTC: Jan 2023 (proc.npy format, 41-col books padded at runtime)
 # Try user's home first, then fallback to shared location
