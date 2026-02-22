@@ -1,9 +1,17 @@
-logs/*
+# Logs
+logs/
 *.out
-*.txt
 *.err
-slurm-*.out
-slurm-*.err
+
+# User-specific config (use config.sh.template)
+config.sh
+
+# Generated index files
+.hf_indices_*.txt
+
+# Results
 results_*/
-all_scores/*
-.vscode/*
+all_scores/
+
+# IDE
+.vscode/
