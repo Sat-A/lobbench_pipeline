@@ -13,5 +13,8 @@ config.sh
 results_*/
 all_scores/
 
+# Core dumps
+core
+
 # IDE
 .vscode/

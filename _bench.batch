@@ -1,26 +1,23 @@
 #!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --gpus=0
+#SBATCH --gpus=1
 
-# CPU scoring batch script for LOBbench pipeline.
+# Scoring batch script for LOBbench pipeline (1 GPU for JAX vmap bootstrap).
 # All parameters received via --export from run_lobbench_pipeline.sh:
-#   LOB_BENCH_DIR, RESULTS_BASE_DIR, PYTHON, STOCK, RUN_NAME,
-#   INFER_OUTPUT, SKIP_HF_COMPARE
+#   REPO_DIR, PYTHON, STOCK, RUN_NAME, INFER_OUTPUT, SKIP_HF_COMPARE
 
 set -euo pipefail
 
 # Login node's TMPDIR (/local/user/...) is invalid on compute nodes — always use /tmp
 export TMPDIR="/tmp"
 export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1  # prevent ~/.local matplotlib (numpy 1.x) from shadowing conda env
 # Extra packages (statsmodels, plotly, kaleido) installed outside conda env due to quota limits
 export PYTHONPATH="/lus/lfs1aip2/projects/s5e/lob_pipeline/pip_packages${PYTHONPATH:+:$PYTHONPATH}"
 
-LOB_BENCH_DIR="${LOB_BENCH_DIR:-/home/s5e/satyamaga.s5e/lob_bench}"
-RESULTS_BASE_DIR="${RESULTS_BASE_DIR:-/projects/s5e/lob_pipeline}"
-
-BENCH_DATA="/projects/s5e/lob_bench/bench_data"
-RESULTS_DIR="${RESULTS_BASE_DIR}/results_${RUN_NAME}"
-HF_DATA="/projects/s5e/lob_pipeline/lob_bench/hf_data_git"
+BENCH_DATA="${REPO_DIR}/bench_data"
+RESULTS_DIR="${REPO_DIR}/results_${RUN_NAME}"
+HF_DATA="${REPO_DIR}/lob_bench/hf_data_git"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -30,7 +27,6 @@ echo "=============================================="
 echo "Job ID:      ${SLURM_JOB_ID}"
 echo "Stock:       ${STOCK}"
 echo "Run name:    ${RUN_NAME}"
-echo "LOBbench:    ${LOB_BENCH_DIR}"
 echo "Infer data:  ${INFER_OUTPUT}"
 echo "HF compare:  $([ "${SKIP_HF_COMPARE}" -eq 0 ] && echo "yes" || echo "no")"
 echo "=============================================="
@@ -154,10 +150,31 @@ fi
 # ============================================================
 # Phase 4: Score
 # ============================================================
+# Supports two modes:
+#   1. Sequential (default): runs all metrics in a single process per model.
+#   2. Sharded (BENCH_SHARDED=1): partitions unconditional metrics across 21
+#      background processes, then merges. Much faster on multi-core nodes.
+#
+# For manual sharded scoring outside the pipeline:
+#   python run_bench.py --uncond_only --metrics "spread,orderbook_imbalance" \
+#       --shard_id 0 --run_id myrun --stock GOOG --model_name s5_main ...
+#   python merge_shards.py "results/scores/scores_uncond_*_shard*_myrun.pkl" \
+#       -o results/scores/scores_uncond_GOOG_s5_main_myrun.pkl
+# ============================================================
 echo ""
 echo "--- Phase 4: Scoring ---"
 
-cd "${LOB_BENCH_DIR}"
+cd "${REPO_DIR}/lob_bench"
+
+# All unconditional metric names (must match DEFAULT_SCORING_CONFIG keys in run_bench.py)
+ALL_UNCOND_METRICS=(
+    spread orderbook_imbalance log_inter_arrival_time log_time_to_cancel
+    ask_volume_touch bid_volume_touch ask_volume bid_volume
+    limit_ask_order_depth limit_bid_order_depth ask_cancellation_depth bid_cancellation_depth
+    limit_ask_order_levels limit_bid_order_levels ask_cancellation_levels bid_cancellation_levels
+    vol_per_min ofi ofi_up ofi_stay ofi_down
+)
+N_UNCOND=${#ALL_UNCOND_METRICS[@]}   # 21
 
 SCORE_ERRORS=0
 for MODEL in $MODELS_TO_SCORE; do
@@ -171,27 +188,132 @@ for MODEL in $MODELS_TO_SCORE; do
     echo ""
     echo "  Scoring ${MODEL} / ${STOCK} (${n_check} samples)..."
 
-    # Phase 4a: Unconditional scoring (baseline — must succeed)
-    echo "    [uncond] Running unconditional scoring..."
-    $PYTHON -u run_bench.py \
-        --data_dir "$BENCH_DATA" \
-        --model_name "$MODEL" \
-        --stock "$STOCK" \
-        --time_period 2023 \
-        --save_dir "$RESULTS_DIR" \
-        --uncond \
-        --progress_interval 120 || { echo "  ERROR: ${MODEL}/${STOCK} uncond scoring failed"; SCORE_ERRORS=$((SCORE_ERRORS + 1)); }
+    RUN_ID="bench_${SLURM_JOB_ID}"
 
-    # Phase 4b: Extended metrics (KS + time-lagged + contextual — non-fatal)
-    echo "    [extended] Running all scoring modes (KS, time-lagged, contextual)..."
-    $PYTHON -u run_bench.py \
-        --data_dir "$BENCH_DATA" \
-        --model_name "$MODEL" \
-        --stock "$STOCK" \
-        --time_period 2023 \
-        --save_dir "$RESULTS_DIR" \
-        --all \
-        --progress_interval 120 2>&1 || { echo "  WARNING: ${MODEL}/${STOCK} extended scoring failed (non-fatal)"; }
+    if [ "${BENCH_SHARDED:-0}" -eq 1 ]; then
+        # --- Sharded unconditional scoring ---
+        echo "    [uncond-sharded] Launching ${N_UNCOND} metric shards..."
+        SHARD_PIDS=()
+        for i in "${!ALL_UNCOND_METRICS[@]}"; do
+            METRIC="${ALL_UNCOND_METRICS[$i]}"
+            $PYTHON -u run_bench.py \
+                --data_dir "$BENCH_DATA" \
+                --model_name "$MODEL" \
+                --stock "$STOCK" \
+                --time_period 2023 \
+                --save_dir "$RESULTS_DIR" \
+                --uncond_only \
+                --metrics "$METRIC" \
+                --shard_id "$i" \
+                --run_id "$RUN_ID" \
+                --progress_interval 120 &
+            SHARD_PIDS+=($!)
+        done
+
+        # Wait for all shards
+        SHARD_FAIL=0
+        for pid in "${SHARD_PIDS[@]}"; do
+            wait "$pid" || SHARD_FAIL=$((SHARD_FAIL + 1))
+        done
+
+        if [ "$SHARD_FAIL" -gt 0 ]; then
+            echo "  ERROR: ${SHARD_FAIL}/${N_UNCOND} uncond shards failed"
+            SCORE_ERRORS=$((SCORE_ERRORS + 1))
+        else
+            # Merge shards
+            echo "    [uncond-sharded] Merging ${N_UNCOND} shards..."
+            $PYTHON -u merge_shards.py \
+                "${RESULTS_DIR}/scores/scores_uncond_${STOCK}_${MODEL}*_shard*_${RUN_ID}.pkl" \
+                -o "${RESULTS_DIR}/scores/scores_uncond_${STOCK}_${MODEL}_${RUN_ID}.pkl" \
+                || { echo "  ERROR: merge failed"; SCORE_ERRORS=$((SCORE_ERRORS + 1)); }
+        fi
+    else
+        # --- Sequential unconditional scoring (original path) ---
+        echo "    [uncond] Running unconditional scoring..."
+        $PYTHON -u run_bench.py \
+            --data_dir "$BENCH_DATA" \
+            --model_name "$MODEL" \
+            --stock "$STOCK" \
+            --time_period 2023 \
+            --save_dir "$RESULTS_DIR" \
+            --uncond_only \
+            --progress_interval 120 || { echo "  ERROR: ${MODEL}/${STOCK} uncond scoring failed"; SCORE_ERRORS=$((SCORE_ERRORS + 1)); }
+    fi
+
+    # Phase 4b: Extended metrics — parallelized as background processes (one per metric)
+    echo "    [extended] Launching extended metric shards..."
+    DIV_HORIZON=100
+    ALL_COND_METRICS=("ask_volume | spread" "spread | time" "spread | volatility")
+    ALL_TIME_LAGGED_METRICS=("ask_volume | spread (t-lag=500)" "ask_volume_touch | ofi (t-lag=500)" "bid_volume_touch | ofi (t-lag=500)")
+    ALL_CONTEXT_METRICS=("ask_volume | spread")
+    ALL_DIV_METRICS=(
+        spread orderbook_imbalance log_inter_arrival_time log_time_to_cancel
+        ask_volume_touch bid_volume_touch ask_volume bid_volume
+        limit_ask_order_depth limit_bid_order_depth ask_cancellation_depth bid_cancellation_depth
+        limit_ask_order_levels limit_bid_order_levels ask_cancellation_levels bid_cancellation_levels
+        vol_per_min ofi ofi_up ofi_stay ofi_down
+    )
+    EXT_PIDS=()
+    for i in "${!ALL_COND_METRICS[@]}"; do
+        $PYTHON -u run_bench.py --data_dir "$BENCH_DATA" --model_name "$MODEL" --stock "$STOCK" \
+            --time_period 2023 --save_dir "$RESULTS_DIR" --cond_only \
+            --metrics "${ALL_COND_METRICS[$i]}" --shard_id "$i" --run_id "$RUN_ID" \
+            --progress_interval 120 &
+        EXT_PIDS+=($!)
+    done
+    for i in "${!ALL_TIME_LAGGED_METRICS[@]}"; do
+        $PYTHON -u run_bench.py --data_dir "$BENCH_DATA" --model_name "$MODEL" --stock "$STOCK" \
+            --time_period 2023 --save_dir "$RESULTS_DIR" --time_lagged_only \
+            --metrics "${ALL_TIME_LAGGED_METRICS[$i]}" --shard_id "$i" --run_id "$RUN_ID" \
+            --progress_interval 120 &
+        EXT_PIDS+=($!)
+    done
+    for i in "${!ALL_CONTEXT_METRICS[@]}"; do
+        $PYTHON -u run_bench.py --data_dir "$BENCH_DATA" --model_name "$MODEL" --stock "$STOCK" \
+            --time_period 2023 --save_dir "$RESULTS_DIR" --context_only \
+            --metrics "${ALL_CONTEXT_METRICS[$i]}" --shard_id "$i" --run_id "$RUN_ID" \
+            --progress_interval 120 &
+        EXT_PIDS+=($!)
+    done
+    for i in "${!ALL_DIV_METRICS[@]}"; do
+        $PYTHON -u run_bench.py --data_dir "$BENCH_DATA" --model_name "$MODEL" --stock "$STOCK" \
+            --time_period 2023 --save_dir "$RESULTS_DIR" --div_only \
+            --metrics "${ALL_DIV_METRICS[$i]}" --shard_id "$i" --run_id "$RUN_ID" \
+            --progress_interval 120 &
+        EXT_PIDS+=($!)
+    done
+
+    # Wait for all extended shards
+    EXT_FAIL=0
+    for pid in "${EXT_PIDS[@]}"; do
+        wait "$pid" || EXT_FAIL=$((EXT_FAIL + 1))
+    done
+    echo "    [extended] ${EXT_FAIL}/${#EXT_PIDS[@]} shards failed"
+
+    # Merge extended shards
+    n=$(ls "${RESULTS_DIR}/scores/scores_cond_${STOCK}_${MODEL}_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+        "${RESULTS_DIR}/scores/scores_cond_${STOCK}_${MODEL}_shard*_${RUN_ID}.pkl" \
+        -o "${RESULTS_DIR}/scores/scores_cond_${STOCK}_${MODEL}_${RUN_ID}.pkl" 2>&1 \
+        || echo "  WARNING: cond merge failed for ${MODEL}"
+
+    n=$(ls "${RESULTS_DIR}/scores/scores_time_lagged_${STOCK}_${MODEL}_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+        "${RESULTS_DIR}/scores/scores_time_lagged_${STOCK}_${MODEL}_shard*_${RUN_ID}.pkl" \
+        -o "${RESULTS_DIR}/scores/scores_time_lagged_${STOCK}_${MODEL}_${RUN_ID}.pkl" 2>&1 \
+        || echo "  WARNING: time_lagged merge failed for ${MODEL}"
+
+    n=$(ls "${RESULTS_DIR}/scores/scores_context_${STOCK}_${MODEL}_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+        "${RESULTS_DIR}/scores/scores_context_${STOCK}_${MODEL}_shard*_${RUN_ID}.pkl" \
+        -o "${RESULTS_DIR}/scores/scores_context_${STOCK}_${MODEL}_${RUN_ID}.pkl" 2>&1 \
+        || echo "  WARNING: context merge failed for ${MODEL}"
+
+    n=$(ls "${RESULTS_DIR}/scores/scores_div_${STOCK}_${MODEL}_shard"*"_${DIV_HORIZON}_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+        "${RESULTS_DIR}/scores/scores_div_${STOCK}_${MODEL}_shard*_${DIV_HORIZON}_${RUN_ID}.pkl" \
+        -o "${RESULTS_DIR}/scores/scores_div_${STOCK}_${MODEL}_${DIV_HORIZON}_${RUN_ID}.pkl" 2>&1 \
+        || echo "  WARNING: div merge failed for ${MODEL}"
 done
 
 # ============================================================

@@ -1,10 +1,11 @@
 #!/bin/bash
-#SBATCH --nodes=1
-#SBATCH --gpus=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
 
 # GPU inference batch script for LOBbench pipeline.
+# Multi-node: srun launches one task per node, each spawns 4 GPU workers.
 # All parameters received via --export from run_lobbench_pipeline.sh:
-#   INFER_REPO_DIR (or REPO_DIR), PYTHON, STOCK, DATA_DIR, CKPT_PATH, CHECKPOINT_STEP,
+#   PIPELINE_DIR, REPO_DIR, PYTHON, STOCK, DATA_DIR, CKPT_PATH, CHECKPOINT_STEP,
 #   RUN_NAME, BATCH_SIZE, N_COND_MSGS, N_GEN_MSGS, N_SEQUENCES,
 #   SAMPLE_INDICES_FILE, SKIP_HF_COMPARE
 
@@ -17,18 +18,20 @@ export TMPDIR="/tmp"
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
 export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1  # prevent ~/.local packages from shadowing conda env
 export INFER_INIT_GLOBAL_BSZ="${INFER_INIT_GLOBAL_BSZ:-1}"
 
-INFER_REPO_DIR="${INFER_REPO_DIR:-${REPO_DIR:-/projects/s5e/lob_pipeline}}"
-SAVE_DIR="${INFER_REPO_DIR}/LOBS5/inference_results/${RUN_NAME}_${STOCK}_${SLURM_JOB_ID}"
+SAVE_DIR="${REPO_DIR}/LOBS5/inference_results/${RUN_NAME}_${STOCK}_${SLURM_JOB_ID}"
+
+GPUS_PER_NODE=4
+WORLD_SIZE=$((SLURM_JOB_NUM_NODES * GPUS_PER_NODE))
 
 echo "=============================================="
-echo "LOBbench Pipeline: Inference"
+echo "LOBbench Pipeline: Inference (${SLURM_JOB_NUM_NODES} node(s), ${WORLD_SIZE} GPUs)"
 echo "=============================================="
 echo "Job ID:      ${SLURM_JOB_ID}"
 echo "Stock:       ${STOCK}"
 echo "Checkpoint:  ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
-echo "Infer repo:  ${INFER_REPO_DIR}"
 echo "Data:        ${DATA_DIR}"
 echo "Output:      ${SAVE_DIR}"
 echo "Config:      ${N_COND_MSGS} cond + ${N_GEN_MSGS} gen, batch ${BATCH_SIZE}"
@@ -56,15 +59,8 @@ if [ "$n_msg_files" -eq 0 ] && [ "$n_proc_files" -eq 0 ]; then
 fi
 
 # ============================================================
-# Pre-flight: detect model architecture for compatibility patching
+# Legacy compat: detect merging mode from checkpoint metadata
 # ============================================================
-# Older checkpoints use FullLobPredModel (merging='projected') which lacks
-# __call_ar__, __call_rnn__, and initialize_carry. We detect this and force
-# merging='padded' at runtime — the core weights (message_encoder, book_encoder,
-# fused_s5, decoder) are shape-compatible since both architectures concatenate
-# along the feature axis producing (seq_len, 2*d_model) for fused_s5.
-# The projection layer weights (message_out_proj, book_out_proj) are loaded
-# but unused. Set LEGACY_COMPAT=0 to disable this override.
 export LEGACY_COMPAT="${LEGACY_COMPAT:-1}"
 
 META_ROOT="${CKPT_PATH}/metadata/_ROOT_METADATA"
@@ -76,7 +72,6 @@ for path in ['${META_ROOT}', '${META_STEP}']:
     try:
         with open(path) as f:
             raw = f.read()
-        # Some older metadata files have trailing garbage after JSON
         brace_depth = 0
         end = 0
         for i, c in enumerate(raw):
@@ -93,7 +88,6 @@ for path in ['${META_ROOT}', '${META_STEP}']:
         if v:
             print(v)
         else:
-            # No merging field: predates padded/projected split (old FullLobPredModel)
             print('projected')
         sys.exit(0)
     except Exception:
@@ -103,201 +97,85 @@ print('unknown')
 
 echo "Detected merging mode: ${MERGING}"
 
+# Choose inference script: legacy compat wrapper or direct run_inference.py
+INFER_SCRIPT="run_inference.py"
 if [ "$MERGING" = "projected" ] && [ "$LEGACY_COMPAT" = "1" ]; then
     echo "[*] Legacy model detected — will force merging='padded' at runtime"
     echo "    (projection layer weights loaded but unused; core weights are shape-compatible)"
     export FORCE_MERGING_PADDED=1
+    INFER_SCRIPT="${PIPELINE_DIR}/_legacy_compat.py"
 elif [ "$MERGING" = "projected" ]; then
     echo "ERROR: merging='projected' checkpoint and LEGACY_COMPAT=0; cannot proceed"
     exit 2
 fi
 
-# Build inference command args
-cd "${INFER_REPO_DIR}/LOBS5"
+# Build base inference command (without rank/world_size — those are added per-process)
+cd "${REPO_DIR}/LOBS5"
 
-INFER_ARGS=(
-    --stock "$STOCK"
-    --ckpt_path "$CKPT_PATH"
-    --data_dir "$DATA_DIR"
-    --save_dir "$SAVE_DIR"
-    --n_cond_msgs "$N_COND_MSGS"
-    --n_gen_msgs "$N_GEN_MSGS"
-    --n_sequences "$N_SEQUENCES"
-    --batch_size "$BATCH_SIZE"
-    --checkpoint_step "$CHECKPOINT_STEP"
-    --test_split 1.0
-)
+CMD="$PYTHON -u ${INFER_SCRIPT} \
+    --stock $STOCK \
+    --ckpt_path \"$CKPT_PATH\" \
+    --data_dir \"$DATA_DIR\" \
+    --save_dir \"$SAVE_DIR\" \
+    --n_cond_msgs $N_COND_MSGS \
+    --n_gen_msgs $N_GEN_MSGS \
+    --n_sequences $N_SEQUENCES \
+    --batch_size $BATCH_SIZE \
+    --checkpoint_step $CHECKPOINT_STEP \
+    --test_split ${TEST_SPLIT:-1.0}"
 
 # HF mode: add sample indices file
 if [ -n "${SAMPLE_INDICES_FILE:-}" ] && [ -f "${SAMPLE_INDICES_FILE:-}" ]; then
-    INFER_ARGS+=(--sample_indices_file "$SAMPLE_INDICES_FILE")
+    CMD="$CMD --sample_indices_file \"$SAMPLE_INDICES_FILE\""
 fi
 
 echo ""
-echo "Running: ${PYTHON} -u run_inference.py ${INFER_ARGS[*]}"
-echo "Runtime patch: global_bsz guard active (argparse + metadata + init_train_state)"
+echo "Base command: ${CMD}"
 echo ""
 
-"$PYTHON" -u - "${INFER_ARGS[@]}" <<'PY' && EXIT_CODE=0 || EXIT_CODE=$?
-import argparse
-import json
-import os
-import runpy
+# Create save directory so all ranks can write logs
+mkdir -p "${SAVE_DIR}"
 
-import lob.init_train as _init_train
+# Launch via srun: one task per node, each spawns GPUS_PER_NODE workers
+echo "Launching ${WORLD_SIZE} ranks across ${SLURM_JOB_NUM_NODES} node(s)..."
 
-_orig_parse_args = argparse.ArgumentParser.parse_args
-_orig_parse_known_args = argparse.ArgumentParser.parse_known_args
-_orig_init_train_state = _init_train.init_train_state
-_orig_load_metadata = _init_train.load_metadata
-_orig_load_checkpoint = _init_train.load_checkpoint
-
-_force_padded = os.environ.get("FORCE_MERGING_PADDED", "0") == "1"
-
-
-def _ensure_global_bsz(ns):
-    if not hasattr(ns, "global_bsz"):
-        bsz = getattr(ns, "bsz", None)
-        if bsz is None:
-            bsz = getattr(ns, "batch_size", 1)
-        num_devices = getattr(ns, "num_devices", 1)
-        ns.global_bsz = max(1, int(bsz) * int(num_devices))
-    if not hasattr(ns, "merging"):
-        ns.merging = os.environ.get("INFER_DEFAULT_MERGING", "padded")
-        print(f"[*] Runtime patch: merging missing in metadata, defaulting to {ns.merging}")
-    # Legacy compat: force projected → padded (weights are shape-compatible)
-    if _force_padded and getattr(ns, "merging", "") != "padded":
-        print(f"[*] Runtime patch: overriding merging='{ns.merging}' → 'padded' (legacy compat)")
-        ns.merging = "padded"
-    return ns
-
-
-def _parse_args_with_global_bsz(self, *args, **kwargs):
-    ns = _orig_parse_args(self, *args, **kwargs)
-    return _ensure_global_bsz(ns)
-
-
-def _parse_known_args_with_global_bsz(self, *args, **kwargs):
-    ns, extras = _orig_parse_known_args(self, *args, **kwargs)
-    return _ensure_global_bsz(ns), extras
-
-
-def _load_metadata_robust(path):
-    """Fallback metadata loader that tolerates trailing garbage after JSON."""
-    from argparse import Namespace
-    json_path = path + '/metadata/_ROOT_METADATA'
-    with open(json_path, 'r') as f:
-        raw = f.read()
-    # Brace-depth parser: find the end of the first complete JSON object
-    depth, end = 0, 0
-    for i, c in enumerate(raw):
-        if c == '{': depth += 1
-        elif c == '}': depth -= 1
-        if depth == 0 and i > 0:
-            end = i + 1
-            break
-    metadata = json.loads(raw[:end] if end > 0 else raw)
-    if 'custom' in metadata:
-        return Namespace(**metadata['custom'])
-    elif 'custom_metadata' in metadata:
-        return Namespace(**metadata['custom_metadata'])
-    return Namespace(**metadata)
-
-
-def _load_metadata_with_global_bsz(*args, **kwargs):
-    try:
-        ns = _orig_load_metadata(*args, **kwargs)
-    except Exception as e:
-        print(f"[*] Runtime patch: load_metadata failed ({e}), using robust fallback")
-        ns = _load_metadata_robust(*args, **kwargs)
-    ns = _ensure_global_bsz(ns)
-    ns.global_bsz = max(1, int(os.environ.get("INFER_INIT_GLOBAL_BSZ", "1")))
-    if not hasattr(ns, "token_mode"):
-        ns.token_mode = 22
-        print("[*] Runtime patch: token_mode missing in metadata, defaulting to legacy token_mode=22")
-    print(f"[*] Runtime patch: forcing inference init global_bsz={ns.global_bsz}")
-    return ns
-
-
-def _load_checkpoint_compat(state, path, step=None, train=True, partial_restore=False):
-    """Wrapper that falls back to _load_ocdbt_direct on any restore error.
-
-    When forcing merging='padded' on a 'projected' checkpoint, the param tree
-    has extra keys (message_out_proj, book_out_proj).  StandardRestore may
-    reject the mismatch, so we catch broadly and fall back to the direct
-    tensorstore loader which is structure-agnostic.
-    """
-    try:
-        return _orig_load_checkpoint(state, path, step=step, train=train,
-                                     partial_restore=partial_restore)
-    except Exception as first_err:
-        if not _force_padded:
-            raise
-        print(f"[*] Runtime patch: load_checkpoint failed ({first_err})")
-        print(f"[*] Runtime patch: retrying with _load_ocdbt_direct (legacy compat)")
-        import jax
-        import orbax.checkpoint as ocp
-
-        if step is None:
-            mngr = ocp.CheckpointManager(os.path.abspath(path),
-                                          item_names=('state', 'metadata'))
-            step = mngr.latest_step()
-        params = _init_train._load_ocdbt_direct(os.path.abspath(path), step)
-        loaded_state = state.replace(params=params, step=step)
-
-        # Load per-step metadata
-        metadata_path = os.path.join(os.path.abspath(path), str(step),
-                                     "metadata", "metadata")
-        ckpt = {}
-        if os.path.exists(metadata_path):
-            with open(metadata_path) as f:
-                raw = f.read()
-            try:
-                ckpt = json.loads(raw)
-            except json.JSONDecodeError:
-                # Tolerate trailing garbage (same as _load_metadata_robust)
-                depth, end = 0, 0
-                for i, c in enumerate(raw):
-                    if c == '{': depth += 1
-                    elif c == '}': depth -= 1
-                    if depth == 0 and i > 0:
-                        end = i + 1
-                        break
-                ckpt = json.loads(raw[:end]) if end > 0 else {}
-
-        if train:
-            from lob.sharding_utils import get_global_mesh, create_state_shardings
-            mesh = get_global_mesh()
-            state_shardings = create_state_shardings(loaded_state, mesh)
-            ckpt['model'] = jax.device_put(loaded_state, state_shardings)
-        else:
-            ckpt['model'] = loaded_state
-        return ckpt
-
-
-def _init_train_state_with_global_bsz(args, *iargs, **ikwargs):
-    args = _ensure_global_bsz(args)
-    return _orig_init_train_state(args, *iargs, **ikwargs)
-
-
-argparse.ArgumentParser.parse_args = _parse_args_with_global_bsz
-argparse.ArgumentParser.parse_known_args = _parse_known_args_with_global_bsz
-_init_train.load_metadata = _load_metadata_with_global_bsz
-_init_train.init_train_state = _init_train_state_with_global_bsz
-_init_train.load_checkpoint = _load_checkpoint_compat
-runpy.run_path("run_inference.py", run_name="__main__")
-PY
+srun bash -c "
+  NODE_RANK=\$SLURM_NODEID
+  PIDS=()
+  for LOCAL_RANK in \$(seq 0 $((GPUS_PER_NODE - 1))); do
+    GLOBAL_RANK=\$((NODE_RANK * $GPUS_PER_NODE + LOCAL_RANK))
+    echo \"[Node \$NODE_RANK] Launching rank \$GLOBAL_RANK on GPU \$LOCAL_RANK...\"
+    CUDA_VISIBLE_DEVICES=\$LOCAL_RANK \
+      eval $CMD --rank \$GLOBAL_RANK --world_size $WORLD_SIZE \
+      > \"${SAVE_DIR}/log_rank\${GLOBAL_RANK}.txt\" 2>&1 &
+    PIDS+=(\$!)
+  done
+  EXIT_CODE=0
+  for i in \${!PIDS[@]}; do
+    wait \${PIDS[\$i]} && RANK_EXIT=0 || RANK_EXIT=\$?
+    GLOBAL_RANK=\$((NODE_RANK * $GPUS_PER_NODE + i))
+    if [ \$RANK_EXIT -ne 0 ]; then
+      echo \"[Node \$NODE_RANK] ERROR: Rank \$GLOBAL_RANK (PID \${PIDS[\$i]}) failed with exit code \$RANK_EXIT\"
+      EXIT_CODE=\$RANK_EXIT
+    else
+      echo \"[Node \$NODE_RANK] Rank \$GLOBAL_RANK (PID \${PIDS[\$i]}) completed successfully\"
+    fi
+  done
+  exit \$EXIT_CODE
+" && EXIT_CODE=0 || EXIT_CODE=$?
 
 echo ""
 echo "=============================================="
 if [ $EXIT_CODE -ne 0 ]; then
     echo "RESULT: FAILED (exit code $EXIT_CODE)"
+    echo "Check per-rank logs: ${SAVE_DIR}/log_rank*.txt"
 else
     echo "RESULT: SUCCESS"
     echo "Output: ${SAVE_DIR}"
     for d in data_real data_gen data_cond; do
         echo "  ${d}/: $(ls "${SAVE_DIR}/${d}/"*message*.csv 2>/dev/null | wc -l) message files"
     done
+    echo "  Ranks: ${WORLD_SIZE} (${SLURM_JOB_NUM_NODES} node(s) x ${GPUS_PER_NODE} GPUs)"
 fi
 echo "=============================================="
 

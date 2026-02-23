@@ -1,0 +1,586 @@
+#!/bin/bash
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-node=4
+
+# Integrated LOBbench pipeline: inference -> scoring -> merge -> extended -> plots
+# Single SLURM job — all phases run sequentially via srun.
+#
+# All parameters received via --export from run_lobbench_pipeline.sh:
+#   PIPELINE_DIR, REPO_DIR, PYTHON, STOCK, DATA_DIR, CKPT_PATH, CHECKPOINT_STEP,
+#   RUN_NAME, BATCH_SIZE, N_COND_MSGS, N_GEN_MSGS, N_SEQUENCES,
+#   SAMPLE_INDICES_FILE, SKIP_HF_COMPARE,
+#   SKIP_INFERENCE, SKIP_EXTENDED, INFER_OUTPUT_OVERRIDE, INFER_NODES,
+#   NTFY_TOPIC_INFERENCE, NTFY_TOPIC_BENCHMARKS
+
+set -euo pipefail
+
+# ============================================================
+# Preamble: Environment
+# ============================================================
+# Login node's TMPDIR (/local/user/...) is invalid on compute nodes — always use /tmp
+export TMPDIR="/tmp"
+export PYTHONUNBUFFERED=1
+export PYTHONNOUSERSITE=1  # prevent ~/.local packages from shadowing conda env
+# NOTE: PYTHONPATH for pip_packages is set AFTER inference (Phase 1) to avoid
+# pip_packages/numpy shadowing the conda numpy during inference.
+
+BENCH_DATA="${REPO_DIR}/bench_data"
+RESULTS_DIR="${REPO_DIR}/results_${RUN_NAME}"
+HF_DATA="${REPO_DIR}/lob_bench/hf_data_git"
+GPUS_PER_NODE=4
+TASK_FILE="${RESULTS_DIR}/.scoring_tasks_${SLURM_JOB_ID}"
+
+mkdir -p "$RESULTS_DIR"
+
+echo "=============================================="
+echo "LOBbench Pipeline: Integrated"
+echo "=============================================="
+echo "Job ID:      ${SLURM_JOB_ID}"
+echo "Stock:       ${STOCK}"
+echo "Checkpoint:  ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
+echo "Data:        ${DATA_DIR}"
+echo "Nodes:       ${SLURM_JOB_NUM_NODES}"
+echo "Run name:    ${RUN_NAME}"
+echo "HF compare:  $([ "${SKIP_HF_COMPARE}" -eq 0 ] && echo "yes" || echo "no")"
+echo "Skip infer:  ${SKIP_INFERENCE:-0}"
+echo "=============================================="
+
+# ============================================================
+# Phase 1: Inference
+# ============================================================
+if [ "${SKIP_INFERENCE:-0}" -eq 1 ]; then
+    echo ""
+    echo "--- Phase 1: Inference (SKIPPED) ---"
+    INFER_OUTPUT="${INFER_OUTPUT_OVERRIDE}"
+    echo "  Using existing: ${INFER_OUTPUT}"
+else
+    echo ""
+    echo "--- Phase 1: Inference ---"
+
+    INFER_OUTPUT="${REPO_DIR}/LOBS5/inference_results/${RUN_NAME}_${STOCK}_${SLURM_JOB_ID}"
+
+    # Use INFER_NODES if set, otherwise use all allocated nodes
+    INFER_NODE_COUNT="${INFER_NODES:-${SLURM_JOB_NUM_NODES}}"
+    WORLD_SIZE=$((INFER_NODE_COUNT * GPUS_PER_NODE))
+
+    echo "  ${WORLD_SIZE} ranks across ${INFER_NODE_COUNT} node(s)"
+    echo "  Output: ${INFER_OUTPUT}"
+
+    # XLA settings for inference (preallocate for max throughput)
+    export XLA_PYTHON_CLIENT_PREALLOCATE=true
+    export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
+
+    cd "${REPO_DIR}/LOBS5"
+
+    # ------------------------------------------------------------------
+    # Legacy compat: detect merging mode from checkpoint metadata
+    # ------------------------------------------------------------------
+    export LEGACY_COMPAT="${LEGACY_COMPAT:-1}"
+
+    META_ROOT="${CKPT_PATH}/metadata/_ROOT_METADATA"
+    META_STEP="${CKPT_PATH}/${CHECKPOINT_STEP}/metadata/metadata"
+
+    MERGING=$("$PYTHON" -c "
+import json, sys
+for path in ['${META_ROOT}', '${META_STEP}']:
+    try:
+        with open(path) as f:
+            raw = f.read()
+        brace_depth = 0
+        end = 0
+        for i, c in enumerate(raw):
+            if c == '{': brace_depth += 1
+            elif c == '}': brace_depth -= 1
+            if brace_depth == 0 and i > 0:
+                end = i + 1
+                break
+        m = json.loads(raw[:end] if end > 0 else raw)
+        d = m.get('custom', m.get('custom_metadata', m))
+        if isinstance(d, dict) and 'config' in d:
+            d = d['config']
+        v = d.get('merging', '')
+        if v:
+            print(v)
+        else:
+            print('projected')
+        sys.exit(0)
+    except Exception:
+        pass
+print('unknown')
+" 2>/dev/null)
+
+    echo "  Detected merging mode: ${MERGING}"
+
+    # Choose inference script: legacy compat wrapper or direct run_inference.py
+    INFER_SCRIPT="run_inference.py"
+    if [ "$MERGING" = "projected" ] && [ "$LEGACY_COMPAT" = "1" ]; then
+        echo "  [*] Legacy model detected — will force merging='padded' at runtime"
+        echo "      (projection layer weights loaded but unused; core weights are shape-compatible)"
+        export FORCE_MERGING_PADDED=1
+        INFER_SCRIPT="${PIPELINE_DIR}/_legacy_compat.py"
+    elif [ "$MERGING" = "projected" ]; then
+        echo "  ERROR: merging='projected' checkpoint and LEGACY_COMPAT=0; cannot proceed"
+        exit 2
+    fi
+
+    CMD="$PYTHON -u ${INFER_SCRIPT} \
+        --stock $STOCK \
+        --ckpt_path \"$CKPT_PATH\" \
+        --data_dir \"$DATA_DIR\" \
+        --save_dir \"$INFER_OUTPUT\" \
+        --n_cond_msgs $N_COND_MSGS \
+        --n_gen_msgs $N_GEN_MSGS \
+        --n_sequences $N_SEQUENCES \
+        --batch_size $BATCH_SIZE \
+        --checkpoint_step $CHECKPOINT_STEP \
+        --test_split ${TEST_SPLIT:-1.0}"
+
+    # HF mode: add sample indices file
+    if [ -n "${SAMPLE_INDICES_FILE:-}" ] && [ -f "${SAMPLE_INDICES_FILE:-}" ]; then
+        CMD="$CMD --sample_indices_file \"$SAMPLE_INDICES_FILE\""
+    fi
+
+    echo "  Command: ${CMD}"
+    mkdir -p "${INFER_OUTPUT}"
+
+    # Launch via srun: one task per node, each spawns GPUS_PER_NODE workers
+    srun --nodes=${INFER_NODE_COUNT} --ntasks=${INFER_NODE_COUNT} --ntasks-per-node=1 \
+        bash -c "
+      NODE_RANK=\$SLURM_NODEID
+      PIDS=()
+      for LOCAL_RANK in \$(seq 0 $((GPUS_PER_NODE - 1))); do
+        GLOBAL_RANK=\$((NODE_RANK * $GPUS_PER_NODE + LOCAL_RANK))
+        echo \"[Node \$NODE_RANK] Launching rank \$GLOBAL_RANK on GPU \$LOCAL_RANK...\"
+        CUDA_VISIBLE_DEVICES=\$LOCAL_RANK \
+          eval $CMD --rank \$GLOBAL_RANK --world_size $WORLD_SIZE \
+          > \"${INFER_OUTPUT}/log_rank\${GLOBAL_RANK}.txt\" 2>&1 &
+        PIDS+=(\$!)
+      done
+      EXIT_CODE=0
+      for i in \${!PIDS[@]}; do
+        wait \${PIDS[\$i]} && RANK_EXIT=0 || RANK_EXIT=\$?
+        GLOBAL_RANK=\$((NODE_RANK * $GPUS_PER_NODE + i))
+        if [ \$RANK_EXIT -ne 0 ]; then
+          echo \"[Node \$NODE_RANK] ERROR: Rank \$GLOBAL_RANK (PID \${PIDS[\$i]}) failed with exit code \$RANK_EXIT\"
+          EXIT_CODE=\$RANK_EXIT
+        else
+          echo \"[Node \$NODE_RANK] Rank \$GLOBAL_RANK (PID \${PIDS[\$i]}) completed successfully\"
+        fi
+      done
+      exit \$EXIT_CODE
+    " && INFER_EXIT=0 || INFER_EXIT=$?
+
+    if [ $INFER_EXIT -ne 0 ]; then
+        echo "FATAL: Inference failed (exit code ${INFER_EXIT})"
+        echo "Check per-rank logs: ${INFER_OUTPUT}/log_rank*.txt"
+        if [ -n "${NTFY_TOPIC_INFERENCE:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+            ~/bin/slurm-notify send "integrated_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) FAILED: inference exit=${INFER_EXIT}" --topic "$NTFY_TOPIC_INFERENCE"
+        fi
+        exit $INFER_EXIT
+    fi
+
+    echo "  Inference SUCCESS"
+    for d in data_real data_gen data_cond; do
+        echo "    ${d}/: $(ls "${INFER_OUTPUT}/${d}/"*message*.csv 2>/dev/null | wc -l) files"
+    done
+
+    if [ -n "${NTFY_TOPIC_INFERENCE:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+        ~/bin/slurm-notify send "integrated_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) inference done, starting scoring" --topic "$NTFY_TOPIC_INFERENCE"
+    fi
+fi
+
+# pip_packages (statsmodels, plotly, kaleido) needed for scoring/plotting phases.
+# Set AFTER inference to avoid pip_packages/numpy shadowing conda numpy.
+export PYTHONPATH="/lus/lfs1aip2/projects/s5e/lob_pipeline/pip_packages${PYTHONPATH:+:$PYTHONPATH}"
+
+# ============================================================
+# Phase 2: Validate + Stage + HF Matching
+# ============================================================
+echo ""
+echo "--- Phase 2: Validate + Stage ---"
+
+if [ ! -d "${INFER_OUTPUT}/data_gen" ]; then
+    echo "FATAL: Inference output not found: ${INFER_OUTPUT}/data_gen"
+    if [ -n "${NTFY_TOPIC_BENCHMARKS:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+        ~/bin/slurm-notify send "integrated_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) FAILED: no inference data" --topic "$NTFY_TOPIC_BENCHMARKS"
+    fi
+    exit 1
+fi
+
+n_gen=$(ls "${INFER_OUTPUT}/data_gen/"*message*.csv 2>/dev/null | wc -l)
+n_real=$(ls "${INFER_OUTPUT}/data_real/"*message*.csv 2>/dev/null | wc -l)
+echo "  Generated: ${n_gen} message files"
+echo "  Real:      ${n_real} message files"
+
+if [ "$n_gen" -eq 0 ]; then
+    echo "FATAL: No generated message files found"
+    if [ -n "${NTFY_TOPIC_BENCHMARKS:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+        ~/bin/slurm-notify send "integrated_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) FAILED: empty inference output" --topic "$NTFY_TOPIC_BENCHMARKS"
+    fi
+    exit 1
+fi
+
+# Stage data (directory symlinks)
+MODEL_DIR="${BENCH_DATA}/${RUN_NAME}/${STOCK}/2023"
+mkdir -p "${MODEL_DIR}"
+ln -sfn "${INFER_OUTPUT}/data_real" "${MODEL_DIR}/data_real"
+ln -sfn "${INFER_OUTPUT}/data_gen"  "${MODEL_DIR}/data_gen"
+ln -sfn "${INFER_OUTPUT}/data_cond" "${MODEL_DIR}/data_cond"
+echo "  Staged ${RUN_NAME}/${STOCK}: ${n_gen} gen, ${n_real} real"
+
+# HF matching (unless skipped)
+MODELS_TO_SCORE="${RUN_NAME}"
+
+if [ "${SKIP_HF_COMPARE}" -eq 0 ]; then
+    echo ""
+    echo "  HF matching..."
+
+    HF_GEN="${HF_DATA}/${STOCK}/data_gen_lobs5"
+
+    if [ ! -d "$HF_GEN" ]; then
+        echo "  WARNING: No HF gen data for ${STOCK}, skipping HF comparison"
+    else
+        # Our gen + real on overlapping indices
+        MATCH_DIR="${BENCH_DATA}/${RUN_NAME}_matched/${STOCK}/2023"
+        mkdir -p "${MATCH_DIR}/data_real" "${MATCH_DIR}/data_gen" "${MATCH_DIR}/data_cond"
+
+        # HF gen + our real on overlapping indices
+        HF_MATCH_DIR="${BENCH_DATA}/hf_${RUN_NAME}_matched/${STOCK}/2023"
+        mkdir -p "${HF_MATCH_DIR}/data_real" "${HF_MATCH_DIR}/data_gen" "${HF_MATCH_DIR}/data_cond"
+
+        matched=0
+        hf_matched=0
+
+        for hf_gen_file in "${HF_GEN}"/*message*.csv; do
+            rid=$(basename "$hf_gen_file" | sed 's/.*real_id_//' | sed 's/_gen.*//')
+            date_str=$(basename "$hf_gen_file" | cut -d'_' -f2)
+
+            our_gen="${INFER_OUTPUT}/data_gen/${STOCK}_${date_str}_message_real_id_${rid}_gen_id_0.csv"
+            our_real="${INFER_OUTPUT}/data_real/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+
+            if [ -f "$our_gen" ] && [ -f "$our_real" ]; then
+                # Our matched subset
+                ln -sf "$our_gen" "${MATCH_DIR}/data_gen/${STOCK}_${date_str}_message_real_id_${rid}_gen_id_0.csv"
+                our_gen_book="${INFER_OUTPUT}/data_gen/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+                [ -f "$our_gen_book" ] && ln -sf "$our_gen_book" "${MATCH_DIR}/data_gen/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+
+                ln -sf "$our_real" "${MATCH_DIR}/data_real/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                our_real_book="${INFER_OUTPUT}/data_real/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                [ -f "$our_real_book" ] && ln -sf "$our_real_book" "${MATCH_DIR}/data_real/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+
+                our_cond="${INFER_OUTPUT}/data_cond/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                our_cond_book="${INFER_OUTPUT}/data_cond/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                [ -f "$our_cond" ] && ln -sf "$our_cond" "${MATCH_DIR}/data_cond/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                [ -f "$our_cond_book" ] && ln -sf "$our_cond_book" "${MATCH_DIR}/data_cond/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                matched=$((matched + 1))
+
+                # HF gen + our real (fair comparison)
+                ln -sf "$hf_gen_file" "${HF_MATCH_DIR}/data_gen/${STOCK}_${date_str}_message_real_id_${rid}_gen_id_0.csv"
+                hf_gen_book="${HF_DATA}/${STOCK}/data_gen_lobs5/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+                [ -f "$hf_gen_book" ] && ln -sf "$hf_gen_book" "${HF_MATCH_DIR}/data_gen/${STOCK}_${date_str}_orderbook_real_id_${rid}_gen_id_0.csv"
+
+                ln -sf "$our_real" "${HF_MATCH_DIR}/data_real/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                [ -f "$our_real_book" ] && ln -sf "$our_real_book" "${HF_MATCH_DIR}/data_real/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                [ -f "$our_cond" ] && ln -sf "$our_cond" "${HF_MATCH_DIR}/data_cond/${STOCK}_${date_str}_message_real_id_${rid}.csv"
+                [ -f "$our_cond_book" ] && ln -sf "$our_cond_book" "${HF_MATCH_DIR}/data_cond/${STOCK}_${date_str}_orderbook_real_id_${rid}.csv"
+                hf_matched=$((hf_matched + 1))
+            fi
+        done
+
+        echo "  ${RUN_NAME}_matched: ${matched} overlapping samples"
+        echo "  hf_${RUN_NAME}_matched: ${hf_matched} HF gen + our real"
+
+        if [ "$matched" -eq 0 ]; then
+            echo "  WARNING: No overlapping samples found — HF comparison skipped"
+        elif [ "$matched" -eq "$n_gen" ]; then
+            # Full overlap (HF mode default): _matched is identical to base model
+            MODELS_TO_SCORE="${MODELS_TO_SCORE} hf_${RUN_NAME}_matched"
+            echo "  (full overlap: skipping redundant ${RUN_NAME}_matched)"
+        else
+            # Partial overlap: _matched is a proper subset, score it separately
+            MODELS_TO_SCORE="${MODELS_TO_SCORE} ${RUN_NAME}_matched hf_${RUN_NAME}_matched"
+        fi
+    fi
+fi
+
+echo "  Models to score: ${MODELS_TO_SCORE}"
+
+# ============================================================
+# Phase 3: Parallel Scoring
+# ============================================================
+echo ""
+echo "--- Phase 3: Parallel Scoring ---"
+
+cd "${REPO_DIR}/lob_bench"
+
+# All unconditional metric names (must match DEFAULT_SCORING_CONFIG keys in run_bench.py)
+ALL_UNCOND_METRICS=(
+    spread orderbook_imbalance log_inter_arrival_time log_time_to_cancel
+    ask_volume_touch bid_volume_touch ask_volume bid_volume
+    limit_ask_order_depth limit_bid_order_depth ask_cancellation_depth bid_cancellation_depth
+    limit_ask_order_levels limit_bid_order_levels ask_cancellation_levels bid_cancellation_levels
+    vol_per_min ofi ofi_up ofi_stay ofi_down
+)
+N_UNCOND=${#ALL_UNCOND_METRICS[@]}   # 21
+
+RUN_ID="integrated_${SLURM_JOB_ID}"
+
+# Build task list: MODEL SHARD_ID METRIC_NAME
+> "$TASK_FILE"
+for MODEL in $MODELS_TO_SCORE; do
+    CHECK="${BENCH_DATA}/${MODEL}/${STOCK}/2023/data_real"
+    n_check=$(ls "${CHECK}"/*message*.csv 2>/dev/null | wc -l)
+    if [ "$n_check" -eq 0 ]; then
+        echo "  Skipping ${MODEL}: no real data staged"
+        continue
+    fi
+    for i in "${!ALL_UNCOND_METRICS[@]}"; do
+        echo "${MODEL} ${i} ${ALL_UNCOND_METRICS[$i]}" >> "$TASK_FILE"
+    done
+done
+
+N_TASKS=$(wc -l < "$TASK_FILE")
+if [ "$N_TASKS" -eq 0 ]; then
+    echo "  No scoring tasks to run"
+else
+    N_SCORING_NODES=$((SLURM_JOB_NUM_NODES < N_TASKS ? SLURM_JOB_NUM_NODES : N_TASKS))
+
+    echo "  Tasks: ${N_TASKS} ($(echo $MODELS_TO_SCORE | wc -w) model(s) x ${N_UNCOND} metrics)"
+    echo "  Scoring nodes: ${N_SCORING_NODES} (round-robin)"
+
+    # Phase 3 srun: one task per scoring node, each handles its share via round-robin
+    srun --nodes=${N_SCORING_NODES} --ntasks=${N_SCORING_NODES} --ntasks-per-node=1 \
+        bash -c "
+        export XLA_PYTHON_CLIENT_PREALLOCATE=false
+        export CUDA_VISIBLE_DEVICES=0
+
+        PROC_ID=\$SLURM_PROCID
+        N_PROCS=${N_SCORING_NODES}
+
+        mapfile -t TASKS < \"${TASK_FILE}\"
+        N_TASKS=\${#TASKS[@]}
+
+        # Round-robin: this proc handles tasks PROC_ID, PROC_ID+N_PROCS, ...
+        TASK_IDX=\$PROC_ID
+        DONE=0
+        FAIL=0
+        while [ \$TASK_IDX -lt \$N_TASKS ]; do
+            LINE=\${TASKS[\$TASK_IDX]}
+            MODEL=\$(echo \"\$LINE\" | cut -d' ' -f1)
+            SHARD_ID=\$(echo \"\$LINE\" | cut -d' ' -f2)
+            METRIC=\$(echo \"\$LINE\" | cut -d' ' -f3)
+
+            echo \"[Proc \$PROC_ID] Scoring \$MODEL / \$METRIC (shard \$SHARD_ID)\"
+
+            ${PYTHON} -u run_bench.py \
+                --data_dir \"${BENCH_DATA}\" \
+                --model_name \"\$MODEL\" \
+                --stock \"${STOCK}\" \
+                --time_period 2023 \
+                --save_dir \"${RESULTS_DIR}\" \
+                --uncond_only \
+                --metrics \"\$METRIC\" \
+                --shard_id \"\$SHARD_ID\" \
+                --run_id \"${RUN_ID}\" \
+                --progress_interval 120 && \
+                { echo \"[Proc \$PROC_ID] DONE: \$MODEL / \$METRIC\"; DONE=\$((DONE + 1)); } || \
+                { echo \"[Proc \$PROC_ID] FAILED: \$MODEL / \$METRIC\"; FAIL=\$((FAIL + 1)); }
+
+            TASK_IDX=\$((TASK_IDX + N_PROCS))
+        done
+        echo \"[Proc \$PROC_ID] Finished: \$DONE ok, \$FAIL failed\"
+        # Exit non-zero only if ALL tasks failed (partial failure is acceptable)
+        [ \$DONE -gt 0 ] && exit 0 || exit 1
+    " && SCORE_EXIT=0 || SCORE_EXIT=$?
+
+    echo "  Parallel scoring exit code: ${SCORE_EXIT}"
+    if [ "$SCORE_EXIT" -ne 0 ]; then
+        echo "  WARNING: Some scoring tasks failed (continuing to merge what succeeded)"
+    fi
+fi
+
+# ============================================================
+# Phase 4: Merge Unconditional + Parallel Extended Scoring
+# ============================================================
+echo ""
+echo "--- Phase 4: Merge + Extended ---"
+
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export CUDA_VISIBLE_DEVICES=0
+
+SCORE_ERRORS=0
+DIV_HORIZON=100
+
+# Extended metric definitions (must match DEFAULT_SCORING_CONFIG_* keys in run_bench.py)
+ALL_COND_METRICS=("ask_volume | spread" "spread | time" "spread | volatility")
+ALL_TIME_LAGGED_METRICS=("ask_volume | spread (t-lag=500)" "ask_volume_touch | ofi (t-lag=500)" "bid_volume_touch | ofi (t-lag=500)")
+ALL_CONTEXT_METRICS=("ask_volume | spread")
+ALL_DIV_METRICS=(
+    spread orderbook_imbalance log_inter_arrival_time log_time_to_cancel
+    ask_volume_touch bid_volume_touch ask_volume bid_volume
+    limit_ask_order_depth limit_bid_order_depth ask_cancellation_depth bid_cancellation_depth
+    limit_ask_order_levels limit_bid_order_levels ask_cancellation_levels bid_cancellation_levels
+    vol_per_min ofi ofi_up ofi_stay ofi_down
+)
+
+# Step 4a: Merge unconditional shards from Phase 3
+echo "  Merging unconditional shards..."
+for MODEL in $MODELS_TO_SCORE; do
+    n_shards=$(ls "${RESULTS_DIR}/scores/scores_uncond_${STOCK}_${MODEL}"*"_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+    if [ "$n_shards" -eq 0 ]; then
+        echo "  Skipping ${MODEL}: no uncond shards found"
+        continue
+    fi
+    echo "  Merging ${MODEL} unconditional (${n_shards} shards)..."
+    $PYTHON -u merge_shards.py \
+        "${RESULTS_DIR}/scores/scores_uncond_${STOCK}_${MODEL}*_shard*_${RUN_ID}.pkl" \
+        --output "${RESULTS_DIR}/scores/scores_uncond_${STOCK}_${MODEL}_${RUN_ID}.pkl" \
+        || { echo "  WARNING: uncond merge failed for ${MODEL}"; SCORE_ERRORS=$((SCORE_ERRORS + 1)); }
+done
+
+if [ "${SKIP_EXTENDED:-0}" -ne 0 ]; then
+    echo "  Extended scoring: SKIPPED (--skip_extended)"
+else
+    # Step 4b: Build extended task list (TSV: MODEL<tab>FLAG<tab>SHARD_ID<tab>METRIC)
+    EXT_TASK_FILE="${RESULTS_DIR}/.ext_tasks_${SLURM_JOB_ID}"
+    > "$EXT_TASK_FILE"
+    for MODEL in $MODELS_TO_SCORE; do
+        CHECK="${BENCH_DATA}/${MODEL}/${STOCK}/2023/data_real"
+        n_check=$(ls "${CHECK}"/*message*.csv 2>/dev/null | wc -l)
+        if [ "$n_check" -eq 0 ]; then
+            echo "  Skipping ${MODEL}: no real data"
+            continue
+        fi
+        for i in "${!ALL_COND_METRICS[@]}"; do
+            printf "%s\t--cond_only\t%s\t%s\n" "$MODEL" "$i" "${ALL_COND_METRICS[$i]}" >> "$EXT_TASK_FILE"
+        done
+        for i in "${!ALL_TIME_LAGGED_METRICS[@]}"; do
+            printf "%s\t--time_lagged_only\t%s\t%s\n" "$MODEL" "$i" "${ALL_TIME_LAGGED_METRICS[$i]}" >> "$EXT_TASK_FILE"
+        done
+        for i in "${!ALL_CONTEXT_METRICS[@]}"; do
+            printf "%s\t--context_only\t%s\t%s\n" "$MODEL" "$i" "${ALL_CONTEXT_METRICS[$i]}" >> "$EXT_TASK_FILE"
+        done
+        for i in "${!ALL_DIV_METRICS[@]}"; do
+            printf "%s\t--div_only\t%s\t%s\n" "$MODEL" "$i" "${ALL_DIV_METRICS[$i]}" >> "$EXT_TASK_FILE"
+        done
+    done
+
+    N_EXT_TASKS=$(wc -l < "$EXT_TASK_FILE")
+    if [ "$N_EXT_TASKS" -eq 0 ]; then
+        echo "  No extended tasks to run"
+    else
+        N_EXT_NODES=$((SLURM_JOB_NUM_NODES < N_EXT_TASKS ? SLURM_JOB_NUM_NODES : N_EXT_TASKS))
+        echo "  Extended tasks: ${N_EXT_TASKS} across ${N_EXT_NODES} nodes ($(echo $MODELS_TO_SCORE | wc -w) model(s))"
+
+        srun --nodes=${N_EXT_NODES} --ntasks=${N_EXT_NODES} --ntasks-per-node=1 \
+            bash -c "
+            export XLA_PYTHON_CLIENT_PREALLOCATE=false
+            export CUDA_VISIBLE_DEVICES=0
+            PROC_ID=\$SLURM_PROCID
+            N_PROCS=${N_EXT_NODES}
+
+            mapfile -t TASKS < \"${EXT_TASK_FILE}\"
+            N_TASKS=\${#TASKS[@]}
+
+            TASK_IDX=\$PROC_ID
+            DONE=0; FAIL=0
+            while [ \$TASK_IDX -lt \$N_TASKS ]; do
+                LINE=\${TASKS[\$TASK_IDX]}
+                MODEL=\$(cut -f1 <<< \"\$LINE\")
+                FLAG=\$(cut -f2 <<< \"\$LINE\")
+                SHARD_ID=\$(cut -f3 <<< \"\$LINE\")
+                METRIC=\$(cut -f4- <<< \"\$LINE\")
+
+                echo \"[Proc \$PROC_ID] \$MODEL / \$FLAG / \$METRIC (shard \$SHARD_ID)\"
+
+                ${PYTHON} -u run_bench.py \
+                    --data_dir \"${BENCH_DATA}\" \
+                    --model_name \"\$MODEL\" \
+                    --stock \"${STOCK}\" \
+                    --time_period 2023 \
+                    --save_dir \"${RESULTS_DIR}\" \
+                    \$FLAG \
+                    --metrics \"\$METRIC\" \
+                    --shard_id \"\$SHARD_ID\" \
+                    --run_id \"${RUN_ID}\" \
+                    --progress_interval 120 && \
+                    { echo \"[Proc \$PROC_ID] DONE: \$FLAG / \$METRIC\"; DONE=\$((DONE + 1)); } || \
+                    { echo \"[Proc \$PROC_ID] FAILED: \$FLAG / \$METRIC\"; FAIL=\$((FAIL + 1)); }
+
+                TASK_IDX=\$((TASK_IDX + N_PROCS))
+            done
+            echo \"[Proc \$PROC_ID] Finished: \$DONE ok, \$FAIL failed\"
+            [ \$DONE -gt 0 ] && exit 0 || exit 1
+        " && EXT_EXIT=0 || EXT_EXIT=$?
+        echo "  Extended scoring exit: ${EXT_EXIT}"
+
+        # Step 4c: Merge extended shards per model per type
+        echo "  Merging extended shards..."
+        for MODEL in $MODELS_TO_SCORE; do
+            n=$(ls "${RESULTS_DIR}/scores/scores_cond_${STOCK}_${MODEL}_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+                "${RESULTS_DIR}/scores/scores_cond_${STOCK}_${MODEL}_shard*_${RUN_ID}.pkl" \
+                --output "${RESULTS_DIR}/scores/scores_cond_${STOCK}_${MODEL}_${RUN_ID}.pkl" \
+                2>&1 || echo "  WARNING: cond merge failed for ${MODEL}"
+
+            n=$(ls "${RESULTS_DIR}/scores/scores_time_lagged_${STOCK}_${MODEL}_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+                "${RESULTS_DIR}/scores/scores_time_lagged_${STOCK}_${MODEL}_shard*_${RUN_ID}.pkl" \
+                --output "${RESULTS_DIR}/scores/scores_time_lagged_${STOCK}_${MODEL}_${RUN_ID}.pkl" \
+                2>&1 || echo "  WARNING: time_lagged merge failed for ${MODEL}"
+
+            n=$(ls "${RESULTS_DIR}/scores/scores_context_${STOCK}_${MODEL}_shard"*"_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+                "${RESULTS_DIR}/scores/scores_context_${STOCK}_${MODEL}_shard*_${RUN_ID}.pkl" \
+                --output "${RESULTS_DIR}/scores/scores_context_${STOCK}_${MODEL}_${RUN_ID}.pkl" \
+                2>&1 || echo "  WARNING: context merge failed for ${MODEL}"
+
+            n=$(ls "${RESULTS_DIR}/scores/scores_div_${STOCK}_${MODEL}_shard"*"_${DIV_HORIZON}_${RUN_ID}.pkl" 2>/dev/null | wc -l)
+            [ "$n" -gt 0 ] && $PYTHON -u merge_shards.py \
+                "${RESULTS_DIR}/scores/scores_div_${STOCK}_${MODEL}_shard*_${DIV_HORIZON}_${RUN_ID}.pkl" \
+                --output "${RESULTS_DIR}/scores/scores_div_${STOCK}_${MODEL}_${DIV_HORIZON}_${RUN_ID}.pkl" \
+                2>&1 || echo "  WARNING: div merge failed for ${MODEL}"
+        done
+    fi
+    rm -f "$EXT_TASK_FILE"
+fi
+
+# ============================================================
+# Phase 5: Plots (with reference models for comparison)
+# ============================================================
+echo ""
+echo "--- Phase 5: Plots ---"
+
+# Build reference directory list: Symlinked-Scores (s5v2N1 etc.) + all existing results
+REF_ARGS=""
+for d in "${REPO_DIR}/Symlinked-Scores" "${REPO_DIR}"/results_*/scores; do
+    [ -d "$d" ] && REF_ARGS="${REF_ARGS} --reference_dir $d"
+done
+
+mkdir -p "${RESULTS_DIR}/plots"
+$PYTHON -u run_plotting.py \
+    --score_dir "${RESULTS_DIR}/scores" \
+    --plot_dir "${RESULTS_DIR}/plots" \
+    --histograms \
+    --filter_incomplete \
+    ${REF_ARGS} 2>&1 || echo "WARNING: Plotting failed (non-fatal)"
+
+# ============================================================
+# Summary
+# ============================================================
+echo ""
+echo "=============================================="
+echo "COMPLETE: ${RUN_NAME} / ${STOCK}"
+echo "=============================================="
+echo "Results: ${RESULTS_DIR}"
+echo "Score errors: ${SCORE_ERRORS}"
+ls -la "${RESULTS_DIR}/scores/"*"${STOCK}"* 2>/dev/null || echo "  (no score files for ${STOCK})"
+echo "=============================================="
+
+# Cleanup
+rm -f "$TASK_FILE"
+
+# Send notification
+if [ -n "${NTFY_TOPIC_BENCHMARKS:-}" ] && command -v ~/bin/slurm-notify &> /dev/null; then
+    ~/bin/slurm-notify send "integrated_${RUN_NAME}_${STOCK} (${SLURM_JOB_ID}) ALL DONE (errors=${SCORE_ERRORS})" --topic "$NTFY_TOPIC_BENCHMARKS"
+fi

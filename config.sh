@@ -10,9 +10,9 @@
 # ============================================================
 # Data directories (per stock)
 # ============================================================
-# GOOG: Jan 2023 test set (24tok_preproc format)
-# Default location in shared space
-GOOG_DATA="${GOOG_DATA:-/projects/s5e/quant/JAN2023/GOOG_24tok_preproc}"
+# GOOG: Jan 2023 test set (14-col raw LOBSTER preprocessed format)
+# Must be raw .npy (not encoded tokens) — LOBbench needs real order_ids and prices.
+GOOG_DATA="${GOOG_DATA:-/lus/lfs1aip2/projects/s5e/lob_pipeline/data/GOOG_jan2023_raw}"
 
 # INTC: Jan 2023 (proc.npy format, 41-col books padded at runtime)
 # Try user's home first, then fallback to shared location
