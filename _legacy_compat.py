@@ -97,6 +97,12 @@ def _load_metadata_with_global_bsz(*args, **kwargs):
     except Exception as e:
         print(f"[*] Runtime patch: load_metadata failed ({e}), using robust fallback")
         ns = _load_metadata_robust(*args, **kwargs)
+    # Detect unwrapped 'custom' key: load_metadata succeeded but returned
+    # Namespace(custom={...}) instead of unpacking the dict contents.
+    if (hasattr(ns, 'custom') and isinstance(getattr(ns, 'custom'), dict)
+            and not hasattr(ns, 'ssm_size_base')):
+        print("[*] Runtime patch: detected unwrapped 'custom' key in metadata, using robust fallback")
+        ns = _load_metadata_robust(*args, **kwargs)
     ns = _ensure_global_bsz(ns)
     ns.global_bsz = max(1, int(os.environ.get("INFER_INIT_GLOBAL_BSZ", "1")))
     if not hasattr(ns, "token_mode"):
@@ -106,7 +112,7 @@ def _load_metadata_with_global_bsz(*args, **kwargs):
     return ns
 
 
-def _load_checkpoint_compat(state, path, step=None, train=True, partial_restore=False):
+def _load_checkpoint_compat(state, path, step=None, train=True, **kwargs):
     """Wrapper that falls back to _load_ocdbt_direct on any restore error.
 
     When forcing merging='padded' on a 'projected' checkpoint, the param tree
@@ -116,7 +122,7 @@ def _load_checkpoint_compat(state, path, step=None, train=True, partial_restore=
     """
     try:
         return _orig_load_checkpoint(state, path, step=step, train=train,
-                                     partial_restore=partial_restore)
+                                     **kwargs)
     except Exception as first_err:
         if not _force_padded:
             raise

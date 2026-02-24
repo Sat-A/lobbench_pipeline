@@ -17,6 +17,7 @@ export TMPDIR="/tmp"
 # XLA/JAX environment
 export XLA_PYTHON_CLIENT_PREALLOCATE=true
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.90
+export TF_CPP_MIN_LOG_LEVEL=2          # suppress noisy XLA C++ warnings (e.g. GH200 SoL)
 export PYTHONUNBUFFERED=1
 export PYTHONNOUSERSITE=1  # prevent ~/.local packages from shadowing conda env
 export INFER_INIT_GLOBAL_BSZ="${INFER_INIT_GLOBAL_BSZ:-1}"
@@ -97,13 +98,13 @@ print('unknown')
 
 echo "Detected merging mode: ${MERGING}"
 
-# Choose inference script: legacy compat wrapper or direct run_inference.py
-INFER_SCRIPT="run_inference.py"
+# Always use legacy compat wrapper (strict superset of run_inference.py):
+# handles unwrapped 'custom' metadata key, missing global_bsz, etc.
+INFER_SCRIPT="${PIPELINE_DIR}/_legacy_compat.py"
 if [ "$MERGING" = "projected" ] && [ "$LEGACY_COMPAT" = "1" ]; then
     echo "[*] Legacy model detected — will force merging='padded' at runtime"
     echo "    (projection layer weights loaded but unused; core weights are shape-compatible)"
     export FORCE_MERGING_PADDED=1
-    INFER_SCRIPT="${PIPELINE_DIR}/_legacy_compat.py"
 elif [ "$MERGING" = "projected" ]; then
     echo "ERROR: merging='projected' checkpoint and LEGACY_COMPAT=0; cannot proceed"
     exit 2
