@@ -60,14 +60,23 @@ if [ "$n_msg_files" -eq 0 ] && [ "$n_proc_files" -eq 0 ]; then
 fi
 
 # ============================================================
-# Legacy compat: detect merging mode from checkpoint metadata
+# Inference script selection
 # ============================================================
-export LEGACY_COMPAT="${LEGACY_COMPAT:-1}"
+if [ "${LEGACY_INFERENCE:-0}" -eq 1 ]; then
+    # Use LOBS5-gan codebase for fully incompatible checkpoints
+    echo "[*] LEGACY INFERENCE MODE: using LOBS5-gan codebase"
+    INFER_SCRIPT="${PIPELINE_DIR}/_legacy_gan_infer.py"
+    export LOBS5_GAN_DIR="${LOBS5_GAN_DIR:-$(dirname "${PIPELINE_DIR}")/LOBS5-gan}"
+    echo "    LOBS5_GAN_DIR=${LOBS5_GAN_DIR}"
+    cd "${LOBS5_GAN_DIR}"
+else
+    # Legacy compat: detect merging mode from checkpoint metadata
+    export LEGACY_COMPAT="${LEGACY_COMPAT:-1}"
 
-META_ROOT="${CKPT_PATH}/metadata/_ROOT_METADATA"
-META_STEP="${CKPT_PATH}/${CHECKPOINT_STEP}/metadata/metadata"
+    META_ROOT="${CKPT_PATH}/metadata/_ROOT_METADATA"
+    META_STEP="${CKPT_PATH}/${CHECKPOINT_STEP}/metadata/metadata"
 
-MERGING=$("$PYTHON" -c "
+    MERGING=$("$PYTHON" -c "
 import json, sys
 for path in ['${META_ROOT}', '${META_STEP}']:
     try:
@@ -96,22 +105,23 @@ for path in ['${META_ROOT}', '${META_STEP}']:
 print('unknown')
 " 2>/dev/null)
 
-echo "Detected merging mode: ${MERGING}"
+    echo "Detected merging mode: ${MERGING}"
 
-# Always use legacy compat wrapper (strict superset of run_inference.py):
-# handles unwrapped 'custom' metadata key, missing global_bsz, etc.
-INFER_SCRIPT="${PIPELINE_DIR}/_legacy_compat.py"
-if [ "$MERGING" = "projected" ] && [ "$LEGACY_COMPAT" = "1" ]; then
-    echo "[*] Legacy model detected — will force merging='padded' at runtime"
-    echo "    (projection layer weights loaded but unused; core weights are shape-compatible)"
-    export FORCE_MERGING_PADDED=1
-elif [ "$MERGING" = "projected" ]; then
-    echo "ERROR: merging='projected' checkpoint and LEGACY_COMPAT=0; cannot proceed"
-    exit 2
+    # Always use legacy compat wrapper (strict superset of run_inference.py):
+    # handles unwrapped 'custom' metadata key, missing global_bsz, etc.
+    INFER_SCRIPT="${PIPELINE_DIR}/_legacy_compat.py"
+    if [ "$MERGING" = "projected" ] && [ "$LEGACY_COMPAT" = "1" ]; then
+        echo "[*] Legacy model detected — will force merging='padded' at runtime"
+        echo "    (projection layer weights loaded but unused; core weights are shape-compatible)"
+        export FORCE_MERGING_PADDED=1
+    elif [ "$MERGING" = "projected" ]; then
+        echo "ERROR: merging='projected' checkpoint and LEGACY_COMPAT=0; cannot proceed"
+        exit 2
+    fi
+
+    # Build base inference command (without rank/world_size — those are added per-process)
+    cd "${REPO_DIR}/LOBS5"
 fi
-
-# Build base inference command (without rank/world_size — those are added per-process)
-cd "${REPO_DIR}/LOBS5"
 
 CMD="$PYTHON -u ${INFER_SCRIPT} \
     --stock $STOCK \

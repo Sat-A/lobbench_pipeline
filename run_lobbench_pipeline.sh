@@ -32,6 +32,7 @@ SKIP_INFERENCE=0
 SKIP_EXTENDED=0
 INFERENCE_DIR=""
 SEPARATE_JOBS=0
+LEGACY_INFERENCE=0
 
 # Integrated mode defaults
 INFER_NODES=4
@@ -62,6 +63,7 @@ if [ $# -lt 1 ]; then
     echo "  --n_sequences N            Custom mode only: number of sequences (default: 1024)"
     echo "  --skip_inference           Reuse existing inference (needs --inference_dir)"
     echo "  --inference_dir DIR        Path to existing inference results"
+    echo "  --legacy_inference         Use LOBS5-gan legacy inference (for old checkpoints)"
     echo ""
     echo "Integrated mode (default):"
     echo "  --infer_nodes N            Inference nodes (default: 4, each has 4 GPUs)"
@@ -96,6 +98,7 @@ while [ $# -gt 0 ]; do
         --skip_extended)    SKIP_EXTENDED=1;        shift 1 ;;
         --inference_dir)    INFERENCE_DIR="$2";    shift 2 ;;
         --separate_jobs)    SEPARATE_JOBS=1;        shift 1 ;;
+        --legacy_inference) LEGACY_INFERENCE=1;     shift 1 ;;
         --infer_walltime)   INFER_WALLTIME="$2";   shift 2 ;;
         --bench_walltime)   BENCH_WALLTIME="$2";   shift 2 ;;
         *) echo "ERROR: Unknown option: $1"; exit 1 ;;
@@ -232,6 +235,7 @@ echo "Repo dir:     ${REPO_DIR}"
 echo "Checkpoint:   ${CKPT_PATH} (step ${CHECKPOINT_STEP})"
 echo "Mode:         $([ "$NO_HF_COMPARE" -eq 1 ] && echo "Custom (${N_SEQUENCES} random)" || echo "HF (matched samples)")"
 echo "Config:       ${N_COND_MSGS} cond + ${N_GEN_MSGS} gen, batch ${BATCH_SIZE}"
+echo "Inference:    $([ "$LEGACY_INFERENCE" -eq 1 ] && echo "LEGACY (LOBS5-gan)" || echo "Standard (LOBS5)")"
 if [ "$SEPARATE_JOBS" -eq 1 ]; then
     echo "Job mode:     Separate (infer ${INFER_WALLTIME} + bench ${BENCH_WALLTIME})"
 else
@@ -274,7 +278,7 @@ for STOCK in $VALID_STOCKS; do
                 --output="${LOGS_DIR}/infer_${NAME}_${STOCK}_%j.out" \
                 --error="${LOGS_DIR}/infer_${NAME}_${STOCK}_%j.err" \
                 --partition="${PARTITION}" \
-                --export=ALL,PIPELINE_DIR="${SCRIPT_DIR}",REPO_DIR="${REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",DATA_DIR="${DATA_DIR}",CKPT_PATH="${CKPT_PATH}",CHECKPOINT_STEP="${CHECKPOINT_STEP}",RUN_NAME="${NAME}",BATCH_SIZE="${BATCH_SIZE}",N_COND_MSGS="${N_COND_MSGS}",N_GEN_MSGS="${N_GEN_MSGS}",N_SEQUENCES="${N_SEQUENCES}",SAMPLE_INDICES_FILE="${SAMPLE_INDICES_FILE}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",NTFY_TOPIC_INFERENCE="${NTFY_TOPIC_INFERENCE}" \
+                --export=ALL,PIPELINE_DIR="${SCRIPT_DIR}",REPO_DIR="${REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",DATA_DIR="${DATA_DIR}",CKPT_PATH="${CKPT_PATH}",CHECKPOINT_STEP="${CHECKPOINT_STEP}",RUN_NAME="${NAME}",BATCH_SIZE="${BATCH_SIZE}",N_COND_MSGS="${N_COND_MSGS}",N_GEN_MSGS="${N_GEN_MSGS}",N_SEQUENCES="${N_SEQUENCES}",SAMPLE_INDICES_FILE="${SAMPLE_INDICES_FILE}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",LEGACY_INFERENCE="${LEGACY_INFERENCE}",NTFY_TOPIC_INFERENCE="${NTFY_TOPIC_INFERENCE}" \
                 "${SCRIPT_DIR}/_infer.batch")
 
             echo "  Inference job: ${INFER_JOB_ID}"
@@ -319,7 +323,7 @@ for STOCK in $VALID_STOCKS; do
             --output="${LOGS_DIR}/integrated_${NAME}_${STOCK}_%j.out" \
             --error="${LOGS_DIR}/integrated_${NAME}_${STOCK}_%j.err" \
             --partition="${PARTITION}" \
-            --export=ALL,PIPELINE_DIR="${SCRIPT_DIR}",REPO_DIR="${REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",DATA_DIR="${DATA_DIR}",CKPT_PATH="${CKPT_PATH}",CHECKPOINT_STEP="${CHECKPOINT_STEP}",RUN_NAME="${NAME}",BATCH_SIZE="${BATCH_SIZE}",N_COND_MSGS="${N_COND_MSGS}",N_GEN_MSGS="${N_GEN_MSGS}",N_SEQUENCES="${N_SEQUENCES}",SAMPLE_INDICES_FILE="${SAMPLE_INDICES_FILE}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",SKIP_INFERENCE="${SKIP_INFERENCE}",SKIP_EXTENDED="${SKIP_EXTENDED}",INFER_OUTPUT_OVERRIDE="${INFER_OUTPUT_OVERRIDE}",INFER_NODES="${INFER_NODES}",NTFY_TOPIC_INFERENCE="${NTFY_TOPIC_INFERENCE}",NTFY_TOPIC_BENCHMARKS="${NTFY_TOPIC_BENCHMARKS}" \
+            --export=ALL,PIPELINE_DIR="${SCRIPT_DIR}",REPO_DIR="${REPO_DIR}",PYTHON="${PYTHON}",STOCK="${STOCK}",DATA_DIR="${DATA_DIR}",CKPT_PATH="${CKPT_PATH}",CHECKPOINT_STEP="${CHECKPOINT_STEP}",RUN_NAME="${NAME}",BATCH_SIZE="${BATCH_SIZE}",N_COND_MSGS="${N_COND_MSGS}",N_GEN_MSGS="${N_GEN_MSGS}",N_SEQUENCES="${N_SEQUENCES}",SAMPLE_INDICES_FILE="${SAMPLE_INDICES_FILE}",SKIP_HF_COMPARE="${SKIP_HF_COMPARE}",SKIP_INFERENCE="${SKIP_INFERENCE}",SKIP_EXTENDED="${SKIP_EXTENDED}",INFER_OUTPUT_OVERRIDE="${INFER_OUTPUT_OVERRIDE}",INFER_NODES="${INFER_NODES}",LEGACY_INFERENCE="${LEGACY_INFERENCE}",NTFY_TOPIC_INFERENCE="${NTFY_TOPIC_INFERENCE}",NTFY_TOPIC_BENCHMARKS="${NTFY_TOPIC_BENCHMARKS}" \
             "${SCRIPT_DIR}/_integrated.batch")
 
         echo "  Job: ${JOB_ID} (${TOTAL_NODES} nodes, ${WALLTIME})"
